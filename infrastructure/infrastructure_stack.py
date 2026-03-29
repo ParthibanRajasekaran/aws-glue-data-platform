@@ -519,6 +519,16 @@ class InfrastructureStack(Stack):
             topic_name="hr-pipeline-alerts",
             display_name="HR Pipeline Alerts",
         )
+        # Without this resource policy CloudWatch cannot publish to the topic.
+        # The service principal must be explicitly granted sns:Publish.
+        alerts_topic.add_to_resource_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("cloudwatch.amazonaws.com")],
+                actions=["sns:Publish"],
+                resources=[alerts_topic.topic_arn],
+            )
+        )
 
         glue_failure_alarm = cloudwatch.Alarm(
             self,
