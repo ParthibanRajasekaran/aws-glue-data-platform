@@ -5,7 +5,6 @@ All AWS calls are mocked — no real credentials or network required.
 import importlib.util
 import json
 import os
-import sys
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -19,13 +18,15 @@ _HANDLER_PATH = os.path.join(
 )
 
 _mock_dynamodb = MagicMock()
+_mock_ssm = MagicMock()
+_mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "test-table"}}
 
-with patch("boto3.resource", return_value=_mock_dynamodb), \
-     patch.dict(os.environ, {"DYNAMO_TABLE": "test-table"}):
+with patch("boto3.client", return_value=_mock_ssm), \
+     patch("boto3.resource", return_value=_mock_dynamodb):
     _spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
     _mod = importlib.util.module_from_spec(_spec)
-    _mod._dynamodb = _mock_dynamodb
     _spec.loader.exec_module(_mod)
+    _mod._dynamodb = _mock_dynamodb
 
 handler = _mod.handler
 
@@ -55,7 +56,6 @@ SAMPLE_ITEM = {
 
 # ── Tests: valid employee ID ───────────────────────────────────────────────────
 
-@patch.dict(os.environ, {"DYNAMO_TABLE": "test-table"})
 class TestHandlerValidId(unittest.TestCase):
     """Handler returns 200 with the correct payload for a known employee."""
 
@@ -105,7 +105,6 @@ class TestHandlerValidId(unittest.TestCase):
 
 # ── Tests: missing employee_id field ─────────────────────────────────────────
 
-@patch.dict(os.environ, {"DYNAMO_TABLE": "test-table"})
 class TestHandlerMissingId(unittest.TestCase):
     """Handler returns 400 when employee_id is absent or None."""
 
@@ -122,7 +121,6 @@ class TestHandlerMissingId(unittest.TestCase):
 
 # ── Tests: employee not found in DynamoDB ─────────────────────────────────────
 
-@patch.dict(os.environ, {"DYNAMO_TABLE": "test-table"})
 class TestHandlerNotFound(unittest.TestCase):
     """Handler returns 404 when DynamoDB has no matching item."""
 

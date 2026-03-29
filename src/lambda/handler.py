@@ -1,20 +1,33 @@
 """
-Lambda API Handler — Phase 2
+Lambda API Handler — Phase 4
 Returns a clean employee profile JSON from DynamoDB single-table.
+Table name fetched from SSM Parameter Store at cold start (Zero-Trust).
 """
 import json
-import os
 from decimal import Decimal
 
 import boto3
 
-# Module-level client — reused across warm Lambda invocations
+# ── Module-level clients — reused across warm Lambda invocations ─────────────
+# SSM fetch happens once at cold start; subsequent warm invocations skip it.
+_ssm = boto3.client("ssm", region_name="us-east-1")
+
+try:
+    _table_name = _ssm.get_parameter(
+        Name="/hr-pipeline/dynamodb-table-name"
+    )["Parameter"]["Value"]
+except Exception as e:
+    raise RuntimeError(
+        "Failed to fetch /hr-pipeline/dynamodb-table-name from SSM. "
+        "Verify the parameter exists and the Lambda role has ssm:GetParameter. "
+        f"Error: {e}"
+    ) from e
+
 _dynamodb = boto3.resource("dynamodb")
 
 
 def handler(event, context):
-    table_name = os.environ["DYNAMO_TABLE"]
-    table = _dynamodb.Table(table_name)
+    table = _dynamodb.Table(_table_name)
 
     emp_id = event.get("employee_id")
     if not emp_id:
