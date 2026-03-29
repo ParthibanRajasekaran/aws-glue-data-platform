@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 
 import aws_cdk as cdk
@@ -5,11 +7,16 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+    aws_athena as athena,
+    aws_cloudwatch as cloudwatch,
     aws_dynamodb as dynamodb,
     aws_glue as glue,
     aws_iam as iam,
+    aws_kms as kms,
     aws_lambda as lambda_,
+    aws_logs as logs,
     aws_s3 as s3,
+    aws_ssm as ssm,
 )
 import aws_cdk.aws_glue_alpha as glue_alpha
 from constructs import Construct
@@ -19,12 +26,23 @@ class InfrastructureStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # ── KMS Key — must be declared before S3/DynamoDB ────────────────────────
+        encryption_key = kms.Key(
+            self,
+            "PipelineEncryptionKey",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            description="CMK for HR pipeline S3 + DynamoDB encryption at rest",
+        )
+
         # ── S3 Buckets ──────────────────────────────────────────────────────────
         raw_bucket = s3.Bucket(
             self,
             "RawDataBucket",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=encryption_key,
         )
 
         parquet_bucket = s3.Bucket(
@@ -32,6 +50,8 @@ class InfrastructureStack(Stack):
             "AthenaParquetBucket",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=encryption_key,
         )
 
         assets_bucket = s3.Bucket(
@@ -39,6 +59,8 @@ class InfrastructureStack(Stack):
             "AssetsBucket",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=encryption_key,
         )
 
         # ── DynamoDB Single-Table ────────────────────────────────────────────────
@@ -54,6 +76,35 @@ class InfrastructureStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.DESTROY,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=encryption_key,
+        )
+
+        # ── SSM Parameter Store — resource discovery (Phase 4) ───────────────────
+        # The Glue ETL script reads these at runtime; no ARNs/names in source code.
+        ssm.StringParameter(
+            self, "SsmKmsKeyArn",
+            parameter_name="/hr-pipeline/kms-key-arn",
+            string_value=encryption_key.key_arn,
+            description="CMK ARN for HR pipeline encryption",
+        )
+        ssm.StringParameter(
+            self, "SsmRawBucketName",
+            parameter_name="/hr-pipeline/raw-bucket-name",
+            string_value=raw_bucket.bucket_name,
+            description="Raw CSV input bucket name",
+        )
+        ssm.StringParameter(
+            self, "SsmParquetBucketName",
+            parameter_name="/hr-pipeline/parquet-bucket-name",
+            string_value=parquet_bucket.bucket_name,
+            description="Parquet output bucket name",
+        )
+        ssm.StringParameter(
+            self, "SsmDynamoTableName",
+            parameter_name="/hr-pipeline/dynamodb-table-name",
+            string_value=table.table_name,
+            description="DynamoDB single-table name",
         )
 
         # ── IAM Role for Glue ETL Job ────────────────────────────────────────────
@@ -67,12 +118,52 @@ class InfrastructureStack(Stack):
                 )
             ],
         )
-        # Least-privilege bucket grants (AWSGlueServiceRole only covers aws-glue-* buckets)
-        raw_bucket.grant_read(glue_role)
-        parquet_bucket.grant_read_write(glue_role)
-        assets_bucket.grant_read(glue_role)
-        # DynamoDB write (PutItem, BatchWriteItem, etc.)
+
+        # S3: read-only, scoped to raw/ prefix per-subdirectory
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=[
+                    raw_bucket.bucket_arn,
+                    f"{raw_bucket.bucket_arn}/raw/*",
+                ],
+            )
+        )
+        # Parquet bucket: write-only, scoped to employees/ prefix
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject", "s3:DeleteObject"],
+                resources=[f"{parquet_bucket.bucket_arn}/employees/*"],
+            )
+        )
+        # Assets bucket: read/write for Glue TempDir
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                ],
+                resources=[
+                    assets_bucket.bucket_arn,
+                    f"{assets_bucket.bucket_arn}/*",
+                ],
+            )
+        )
+        # DynamoDB write
         table.grant_write_data(glue_role)
+        # KMS: encrypt/decrypt all three buckets and DynamoDB
+        encryption_key.grant(glue_role, "kms:GenerateDataKey*", "kms:Decrypt")
+        # SSM: read config parameters at job runtime
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter", "ssm:GetParameters"],
+                resources=[
+                    f"arn:aws:ssm:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:parameter/hr-pipeline/*"
+                ],
+            )
+        )
 
         # ── Glue ETL Job ─────────────────────────────────────────────────────────
         glue_job = glue_alpha.PySparkEtlJob(
@@ -84,18 +175,43 @@ class InfrastructureStack(Stack):
                 )
             ),
             glue_version=glue_alpha.GlueVersion.V4_0,
-            worker_type=glue_alpha.WorkerType.G_1X,
+            worker_type=glue_alpha.WorkerType.G_025X,
             number_of_workers=2,
+            max_retries=0,
+            timeout=Duration.minutes(5),
             default_arguments={
-                "--raw_bucket": raw_bucket.bucket_name,
-                "--parquet_bucket": parquet_bucket.bucket_name,
-                "--dynamo_table": table.table_name,
+                # Bucket/table config now fetched from SSM at runtime — not passed here
                 "--TempDir": f"s3://{assets_bucket.bucket_name}/temp/",
                 "--job-language": "python",
                 "--enable-continuous-cloudwatch-log": "true",
+                # Phase 4: Incremental processing + observability
+                "--job-bookmark-option":           "job-bookmark-enable",
+                "--enable-metrics":                "",
+                "--enable-observability-metrics":  "true",
+                "--enable-glue-datacatalog":       "",
             },
             role=glue_role,
         )
+
+        # MaxConcurrentRuns=1 — prevents race conditions on the DynamoDB single-table
+        cfn_glue_job = glue_job.node.default_child
+        cfn_glue_job.execution_property = glue.CfnJob.ExecutionPropertyProperty(
+            max_concurrent_runs=1
+        )
+
+        # ── CloudWatch Log Retention ─────────────────────────────────────────────
+        for lg_name, lg_id in [
+            ("/aws-glue/jobs/logs-v2", "GlueLogV2"),
+            ("/aws-glue/jobs/error",   "GlueLogError"),
+            ("/aws-glue/jobs/output",  "GlueLogOutput"),
+        ]:
+            logs.LogGroup(
+                self,
+                lg_id,
+                log_group_name=lg_name,
+                retention=logs.RetentionDays.ONE_DAY,
+                removal_policy=RemovalPolicy.DESTROY,
+            )
 
         # ── Glue Data Catalog ─────────────────────────────────────────────────────
         cfn_database = glue.CfnDatabase(
@@ -104,43 +220,227 @@ class InfrastructureStack(Stack):
             catalog_id=cdk.Aws.ACCOUNT_ID,
             database_input=glue.CfnDatabase.DatabaseInputProperty(
                 name="hr_analytics",
-                description="HR analytics database — Phase 2 ETL pipeline",
+                description="HR analytics database — Phase 4 ETL pipeline",
             ),
         )
 
-        # Separate crawler role: read-only on parquet bucket
-        crawler_role = iam.Role(
-            self,
-            "CrawlerRole",
-            assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
-            managed_policies=[
-                iam.ManagedPolicy.from_aws_managed_policy_name(
-                    "service-role/AWSGlueServiceRole"
-                )
+        # Helper to build a CSV CfnTable (avoids repeating the serde block)
+        def _csv_table(construct_id, table_name, description, location, columns):
+            t = glue.CfnTable(
+                self,
+                construct_id,
+                catalog_id=cdk.Aws.ACCOUNT_ID,
+                database_name="hr_analytics",
+                table_input=glue.CfnTable.TableInputProperty(
+                    name=table_name,
+                    description=description,
+                    table_type="EXTERNAL_TABLE",
+                    parameters={
+                        "classification": "csv",
+                        "skip.header.line.count": "1",
+                    },
+                    storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
+                        # Trailing slash — Athena treats location as a prefix, not a file
+                        location=location,
+                        input_format="org.apache.hadoop.mapred.TextInputFormat",
+                        output_format="org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+                        serde_info=glue.CfnTable.SerdeInfoProperty(
+                            serialization_library="org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+                            parameters={"field.delim": ","},
+                        ),
+                        columns=columns,
+                    ),
+                ),
+            )
+            t.add_dependency(cfn_database)
+            return t
+
+        # Raw source tables — schema matches the hardcoded StructType in etl_job.py
+        raw_employees_table = _csv_table(
+            "RawEmployeesTable",
+            "raw_employees",
+            "Raw employee CSV data — source for ETL",
+            f"s3://{raw_bucket.bucket_name}/raw/employees/",
+            [
+                glue.CfnTable.ColumnProperty(name="EmployeeID",       type="int"),
+                glue.CfnTable.ColumnProperty(name="FirstName",        type="string"),
+                glue.CfnTable.ColumnProperty(name="LastName",         type="string"),
+                glue.CfnTable.ColumnProperty(name="Email",            type="string"),
+                glue.CfnTable.ColumnProperty(name="DeptID",           type="int"),
+                glue.CfnTable.ColumnProperty(name="Department",       type="string"),
+                glue.CfnTable.ColumnProperty(name="JobTitle",         type="string"),
+                glue.CfnTable.ColumnProperty(name="Salary",           type="int"),
+                glue.CfnTable.ColumnProperty(name="HireDate",         type="string"),
+                glue.CfnTable.ColumnProperty(name="City",             type="string"),
+                glue.CfnTable.ColumnProperty(name="State",            type="string"),
+                glue.CfnTable.ColumnProperty(name="EmploymentStatus", type="string"),
+                glue.CfnTable.ColumnProperty(name="ManagerID",        type="int"),
+                glue.CfnTable.ColumnProperty(name="Manager",          type="string"),
             ],
         )
-        parquet_bucket.grant_read(crawler_role)
 
-        cfn_crawler = glue.CfnCrawler(
+        _csv_table(
+            "RawManagersTable",
+            "raw_managers",
+            "Raw managers CSV data — lookup table for ETL",
+            f"s3://{raw_bucket.bucket_name}/raw/managers/",
+            [
+                glue.CfnTable.ColumnProperty(name="ManagerID",    type="int"),
+                glue.CfnTable.ColumnProperty(name="ManagerName",  type="string"),
+                glue.CfnTable.ColumnProperty(name="Department",   type="string"),
+                glue.CfnTable.ColumnProperty(name="ManagerEmail", type="string"),
+                glue.CfnTable.ColumnProperty(name="IsActive",     type="string"),
+                glue.CfnTable.ColumnProperty(name="Level",        type="string"),
+            ],
+        )
+
+        _csv_table(
+            "RawDepartmentsTable",
+            "raw_departments",
+            "Raw departments CSV data — lookup table for ETL",
+            f"s3://{raw_bucket.bucket_name}/raw/departments/",
+            [
+                glue.CfnTable.ColumnProperty(name="DeptID",           type="int"),
+                glue.CfnTable.ColumnProperty(name="DepartmentName",   type="string"),
+                glue.CfnTable.ColumnProperty(name="Budget",           type="int"),
+                glue.CfnTable.ColumnProperty(name="MinSalaryRange",   type="int"),
+                glue.CfnTable.ColumnProperty(name="MaxSalaryRange",   type="int"),
+                glue.CfnTable.ColumnProperty(name="IsRemoteFriendly", type="string"),
+            ],
+        )
+
+        # Enriched Parquet output table (Hive-partitioned)
+        cfn_table = glue.CfnTable(
             self,
-            "HrParquetCrawler",
-            name="hr-parquet-crawler",
-            role=crawler_role.role_arn,
+            "HrEmployeesTable",
+            catalog_id=cdk.Aws.ACCOUNT_ID,
             database_name="hr_analytics",
-            targets=glue.CfnCrawler.TargetsProperty(
-                s3_targets=[
-                    glue.CfnCrawler.S3TargetProperty(
-                        path=f"s3://{parquet_bucket.bucket_name}/employees/"
-                    )
-                ]
-            ),
-            schema_change_policy=glue.CfnCrawler.SchemaChangePolicyProperty(
-                update_behavior="LOG",
-                delete_behavior="LOG",
+            table_input=glue.CfnTable.TableInputProperty(
+                name="employees",
+                description="HR employee enriched data — Phase 4 ETL output",
+                table_type="EXTERNAL_TABLE",
+                parameters={
+                    "classification": "parquet",
+                    "parquet.compression": "SNAPPY",
+                },
+                storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
+                    location=f"s3://{parquet_bucket.bucket_name}/employees/",
+                    input_format="org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    output_format="org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    serde_info=glue.CfnTable.SerdeInfoProperty(
+                        serialization_library="org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                        parameters={"serialization.format": "1"},
+                    ),
+                    columns=[
+                        glue.CfnTable.ColumnProperty(name="EmployeeID",         type="int"),
+                        glue.CfnTable.ColumnProperty(name="FirstName",          type="string"),
+                        glue.CfnTable.ColumnProperty(name="LastName",           type="string"),
+                        glue.CfnTable.ColumnProperty(name="Email",              type="string"),
+                        glue.CfnTable.ColumnProperty(name="DeptID",             type="string"),
+                        glue.CfnTable.ColumnProperty(name="Department",         type="string"),
+                        glue.CfnTable.ColumnProperty(name="JobTitle",           type="string"),
+                        glue.CfnTable.ColumnProperty(name="Salary",             type="double"),
+                        glue.CfnTable.ColumnProperty(name="HireDate",           type="date"),
+                        glue.CfnTable.ColumnProperty(name="City",               type="string"),
+                        glue.CfnTable.ColumnProperty(name="State",              type="string"),
+                        glue.CfnTable.ColumnProperty(name="EmploymentStatus",   type="string"),
+                        glue.CfnTable.ColumnProperty(name="ManagerID",          type="string"),
+                        glue.CfnTable.ColumnProperty(name="Manager",            type="string"),
+                        glue.CfnTable.ColumnProperty(name="DepartmentName",     type="string"),
+                        glue.CfnTable.ColumnProperty(name="MaxSalaryRange",     type="double"),
+                        glue.CfnTable.ColumnProperty(name="MinSalaryRange",     type="double"),
+                        glue.CfnTable.ColumnProperty(name="Budget",             type="bigint"),
+                        glue.CfnTable.ColumnProperty(name="ManagerName",        type="string"),
+                        glue.CfnTable.ColumnProperty(name="IsActive",           type="string"),
+                        glue.CfnTable.ColumnProperty(name="Level",              type="string"),
+                        glue.CfnTable.ColumnProperty(name="HighestTitleSalary", type="double"),
+                        glue.CfnTable.ColumnProperty(name="CompaRatio",         type="double"),
+                        glue.CfnTable.ColumnProperty(name="RequiresReview",     type="boolean"),
+                    ],
+                ),
+                partition_keys=[
+                    glue.CfnTable.ColumnProperty(name="year",  type="int"),
+                    glue.CfnTable.ColumnProperty(name="month", type="int"),
+                    glue.CfnTable.ColumnProperty(name="dept",  type="string"),
+                ],
             ),
         )
-        # Ensure database exists before crawler is created
-        cfn_crawler.add_dependency(cfn_database)
+        cfn_table.add_dependency(cfn_database)
+
+        # ── Athena Reconciliation View (Phase 4) ──────────────────────────────────
+        # Compares row counts between raw CSV source and enriched Parquet output.
+        # Stored as a VIRTUAL_VIEW in the Glue Catalog — queryable from Athena.
+        _view_sql = (
+            "SELECT 'raw_employees' AS data_source, COUNT(*) AS row_count "
+            "FROM hr_analytics.raw_employees "
+            "UNION ALL "
+            "SELECT 'employees_parquet' AS data_source, COUNT(*) AS row_count "
+            "FROM hr_analytics.employees"
+        )
+        _view_def = json.dumps(
+            {
+                "originalSql": _view_sql,
+                "catalog": "awsdatacatalog",
+                "schema": "hr_analytics",
+                "columns": [
+                    {"name": "data_source", "type": "varchar"},
+                    {"name": "row_count",   "type": "bigint"},
+                ],
+                "owner": "admin",
+                "runAsInvoker": False,
+            },
+            separators=(",", ":"),
+        )
+        _view_encoded = base64.b64encode(_view_def.encode("utf-8")).decode("utf-8")
+
+        cfn_view = glue.CfnTable(
+            self,
+            "ReconciliationView",
+            catalog_id=cdk.Aws.ACCOUNT_ID,
+            database_name="hr_analytics",
+            table_input=glue.CfnTable.TableInputProperty(
+                name="v_etl_reconciliation",
+                description="Reconciliation view: raw CSV count vs enriched Parquet count",
+                table_type="VIRTUAL_VIEW",
+                view_original_text=f"/* Presto View: {_view_encoded} */",
+                view_expanded_text="/* Presto View */",
+                parameters={"presto_view": "true"},
+                storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
+                    location="",
+                    input_format="",
+                    output_format="",
+                    serde_info=glue.CfnTable.SerdeInfoProperty(
+                        serialization_library="org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+                    ),
+                    columns=[
+                        glue.CfnTable.ColumnProperty(name="data_source", type="string"),
+                        glue.CfnTable.ColumnProperty(name="row_count",   type="bigint"),
+                    ],
+                ),
+            ),
+        )
+        # View must be created after both its source tables
+        cfn_view.add_dependency(cfn_table)
+        cfn_view.add_dependency(raw_employees_table)
+
+        # ── Athena Workgroup (Phase 4) ────────────────────────────────────────────
+        # Dedicated workgroup with CloudWatch metrics to track per-query cost.
+        # Results land in assets_bucket/athena-results/ — encrypted by bucket SSE-KMS.
+        athena.CfnWorkGroup(
+            self,
+            "HrAnalyticsWorkgroup",
+            name="hr_analytics_wg",
+            description="Dedicated workgroup for HR analytics — CloudWatch metrics enabled",
+            work_group_configuration=athena.CfnWorkGroup.WorkGroupConfigurationProperty(
+                result_configuration=athena.CfnWorkGroup.ResultConfigurationProperty(
+                    output_location=f"s3://{assets_bucket.bucket_name}/athena-results/",
+                ),
+                publish_cloud_watch_metrics_enabled=True,
+                enforce_work_group_configuration=True,
+                bytes_scanned_cutoff_per_query=104857600,  # 100 MB hard cap — prevents runaway scan cost
+            ),
+            recursive_delete_option=True,
+        )
 
         # ── Lambda API Handler ────────────────────────────────────────────────────
         lambda_fn = lambda_.Function(
@@ -158,37 +458,58 @@ class InfrastructureStack(Stack):
             },
             timeout=Duration.seconds(30),
         )
-        # Least-privilege: GetItem, BatchGetItem, Query, Scan only
         table.grant_read_data(lambda_fn)
 
+        # ── CloudWatch Dashboard ──────────────────────────────────────────────────
+        dashboard = cloudwatch.Dashboard(
+            self,
+            "HrPipelineDashboard",
+            dashboard_name="hr-pipeline-observability",
+        )
+        dashboard.add_widgets(
+            cloudwatch.GraphWidget(
+                title="Glue ETL — Succeeded vs Failed Tasks",
+                left=[
+                    cloudwatch.Metric(
+                        namespace="Glue",
+                        metric_name="glue.driver.aggregate.numSucceededTasks",
+                        dimensions_map={"JobName": glue_job.job_name},
+                        label="Succeeded Tasks",
+                        statistic="Sum",
+                        period=Duration.minutes(5),
+                    ),
+                ],
+                right=[
+                    cloudwatch.Metric(
+                        namespace="Glue",
+                        metric_name="glue.driver.aggregate.numFailedTasks",
+                        dimensions_map={"JobName": glue_job.job_name},
+                        label="Failed Tasks",
+                        statistic="Sum",
+                        period=Duration.minutes(5),
+                    ),
+                ],
+            ),
+            cloudwatch.GraphWidget(
+                title="Athena — Bytes Scanned per Query",
+                left=[
+                    cloudwatch.Metric(
+                        namespace="AWS/Athena",
+                        metric_name="DataScannedInBytes",
+                        dimensions_map={"WorkGroup": "hr_analytics_wg"},
+                        label="Bytes Scanned",
+                        statistic="Sum",
+                        period=Duration.minutes(5),
+                    ),
+                ],
+            ),
+        )
+
         # ── Stack Outputs ─────────────────────────────────────────────────────────
-        cdk.CfnOutput(
-            self, "RawBucketName",
-            value=raw_bucket.bucket_name,
-            description="S3 bucket for raw CSV input files",
-        )
-        cdk.CfnOutput(
-            self, "ParquetBucketName",
-            value=parquet_bucket.bucket_name,
-            description="S3 bucket for Parquet ETL output (Athena)",
-        )
-        cdk.CfnOutput(
-            self, "AssetsBucketName",
-            value=assets_bucket.bucket_name,
-            description="S3 bucket for Glue temp files",
-        )
-        cdk.CfnOutput(
-            self, "GlueJobName",
-            value=glue_job.job_name,
-            description="Glue ETL job name",
-        )
-        cdk.CfnOutput(
-            self, "LambdaFunctionName",
-            value=lambda_fn.function_name,
-            description="Lambda API handler function name",
-        )
-        cdk.CfnOutput(
-            self, "DynamoTableName",
-            value=table.table_name,
-            description="DynamoDB single-table name",
-        )
+        cdk.CfnOutput(self, "RawBucketName",     value=raw_bucket.bucket_name)
+        cdk.CfnOutput(self, "ParquetBucketName", value=parquet_bucket.bucket_name)
+        cdk.CfnOutput(self, "AssetsBucketName",  value=assets_bucket.bucket_name)
+        cdk.CfnOutput(self, "GlueJobName",       value=glue_job.job_name)
+        cdk.CfnOutput(self, "LambdaFunctionName",value=lambda_fn.function_name)
+        cdk.CfnOutput(self, "DynamoTableName",   value=table.table_name)
+        cdk.CfnOutput(self, "KmsKeyArn",         value=encryption_key.key_arn)
