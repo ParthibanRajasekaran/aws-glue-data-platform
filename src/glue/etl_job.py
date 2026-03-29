@@ -178,6 +178,10 @@ dynamo_df = (
     .withColumn("SK", F.lit("PROFILE"))
 )
 
+# Explicit null guard: a null DateType casts to a null StringType;
+# name the column directly rather than relying on schema inspection.
+dynamo_df = dynamo_df.na.fill("", ["HireDate"])
+
 # Null safety: DynamoDB rejects null attribute values; fill with safe defaults.
 # LEFT JOINs above can produce nulls for unmatched departments/managers rows.
 dynamo_df = dynamo_df.na.fill(
