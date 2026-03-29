@@ -1,5 +1,5 @@
 #!/bin/bash
-# deploy.sh — Phase 2 full deployment
+# deploy.sh — Phase 3 full deployment
 # Usage: bash deploy.sh
 set -euo pipefail
 
@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "========================================"
-echo " Phase 2 — AWS CDK Deploy"
+echo " Phase 3 — AWS CDK Deploy"
 echo "========================================"
 
 # ── 1. Install CDK CLI ────────────────────────────────────────────────────────
@@ -51,11 +51,11 @@ echo "  Lambda        : $LAMBDA_FN"
 echo "  DynamoDB table: $DYNAMO_TABLE"
 echo ""
 
-# ── 6. Upload CSVs to raw bucket ──────────────────────────────────────────────
-echo "[6/7] Uploading CSVs to s3://$RAW_BUCKET/..."
-aws s3 cp data/employee_data_updated.csv "s3://${RAW_BUCKET}/employee_data_updated.csv" --region us-east-1
-aws s3 cp data/managers_data.csv         "s3://${RAW_BUCKET}/managers_data.csv"         --region us-east-1
-aws s3 cp data/departments_data.csv      "s3://${RAW_BUCKET}/departments_data.csv"      --region us-east-1
+# ── 6. Upload CSVs to raw bucket (per-subdirectory — matches CfnTable locations)
+echo "[6/7] Uploading CSVs to s3://$RAW_BUCKET/raw/..."
+aws s3 cp data/employee_data_updated.csv "s3://${RAW_BUCKET}/raw/employees/employee_data_updated.csv" --region us-east-1
+aws s3 cp data/managers_data.csv         "s3://${RAW_BUCKET}/raw/managers/managers_data.csv"          --region us-east-1
+aws s3 cp data/departments_data.csv      "s3://${RAW_BUCKET}/raw/departments/departments_data.csv"    --region us-east-1
 echo "CSVs uploaded."
 
 # ── 7. Start Glue ETL job ─────────────────────────────────────────────────────
@@ -78,3 +78,7 @@ echo "  Verify API:   bash verify_api.sh"
 echo ""
 echo "  The Glue job typically takes 3-5 minutes to complete."
 echo "  After it succeeds, run verify_api.sh to test the Lambda."
+
+# ── Cleanup (run manually when done) ─────────────────────────────────────────
+# cdk destroy HrPipelineStack --app "python3 infrastructure/app.py"
+# Note: KMS key enters a 7-day scheduled deletion window after stack destroy.
