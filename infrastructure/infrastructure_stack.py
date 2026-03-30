@@ -170,12 +170,17 @@ class InfrastructureStack(Stack):
                         f"{assets_bucket.bucket_arn}/*",
                     ],
                 ),
-                # PutItem + BatchWriteItem only — the Glue DynamoDB connector write mode.
+                # DescribeTable: Glue DynamoDB connector validates key schema pre-write.
+                # PutItem + BatchWriteItem: connector write mode (batch path).
                 # Replaces grant_write_data() which also granted UpdateItem, DeleteItem,
                 # GetItem, Scan, Query, ConditionCheckItem — none used by the ETL job.
                 iam.PolicyStatement(
                     sid="DynamoDBScopedWrite",
-                    actions=["dynamodb:PutItem", "dynamodb:BatchWriteItem"],
+                    actions=[
+                        "dynamodb:DescribeTable",
+                        "dynamodb:PutItem",
+                        "dynamodb:BatchWriteItem",
+                    ],
                     resources=[table.table_arn],
                 ),
                 iam.PolicyStatement(
