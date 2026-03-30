@@ -136,67 +136,73 @@ class InfrastructureStack(Stack):
             ],
         )
 
-        # S3: read-only, scoped to raw/ prefix per-subdirectory
-        glue_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:GetObject", "s3:ListBucket"],
-                resources=[
-                    raw_bucket.bucket_arn,
-                    f"{raw_bucket.bucket_arn}/raw/*",
-                ],
-            )
-        )
-        # Parquet bucket: write-only.
-        # employees*  covers both employees/ (data) and employees_$folder$
-        # (the Hadoop folder marker Spark writes at the bucket root when using
-        # overwrite mode — without this the job gets AccessDenied on DeleteObject).
-        glue_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:PutObject", "s3:DeleteObject"],
-                resources=[f"{parquet_bucket.bucket_arn}/employees*"],
-            )
-        )
-        # Assets bucket: read/write for Glue TempDir
-        glue_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "s3:GetObject",
-                    "s3:PutObject",
-                    "s3:DeleteObject",
-                    "s3:ListBucket",
-                ],
-                resources=[
-                    assets_bucket.bucket_arn,
-                    f"{assets_bucket.bucket_arn}/*",
-                ],
-            )
-        )
-        # DynamoDB write
-        table.grant_write_data(glue_role)
-        # KMS: encrypt/decrypt all three buckets and DynamoDB
-        encryption_key.grant(glue_role, "kms:GenerateDataKey*", "kms:Decrypt")
-        # SSM: read config parameters at job runtime
-        glue_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["ssm:GetParameter", "ssm:GetParameters"],
-                resources=[
-                    f"arn:aws:ssm:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:parameter/hr-pipeline/*"
-                ],
-            )
-        )
-        # Glue Catalog: automatic partition registration after each Parquet write.
-        # getSink with enableUpdateCatalog=True calls BatchCreatePartition +
-        # UpdateTable so Athena can query new partitions without MSCK REPAIR TABLE.
-        # Scoped to the specific catalog, database, and table — no wildcard resource.
-        glue_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["glue:BatchCreatePartition", "glue:UpdateTable"],
-                resources=[
-                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:catalog",
-                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:database/hr_analytics",
-                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:table/hr_analytics/employees",
-                ],
-            )
+        # ── Data-access policy — single auditable ManagedPolicy ─────────────────
+        # Consolidates all data permissions into one construct, replacing the
+        # previous scattered add_to_policy calls and broad grant_write_data().
+        iam.ManagedPolicy(
+            self, "GlueDataAccessPolicy",
+            description="Scoped data-access permissions for the HR ETL Glue job",
+            roles=[glue_role],
+            statements=[
+                # s3:ListBucket retained: from_catalog() calls ListObjectsV2 to
+                # enumerate files at the prefix before issuing GetObject per file.
+                # Removing it causes AccessDenied before any read is attempted.
+                iam.PolicyStatement(
+                    sid="S3RawRead",
+                    actions=["s3:GetObject", "s3:ListBucket"],
+                    resources=[
+                        raw_bucket.bucket_arn,
+                        f"{raw_bucket.bucket_arn}/raw/*",
+                    ],
+                ),
+                # employees* covers both data files and the Hadoop folder marker object
+                iam.PolicyStatement(
+                    sid="S3ParquetWrite",
+                    actions=["s3:PutObject", "s3:DeleteObject"],
+                    resources=[f"{parquet_bucket.bucket_arn}/employees*"],
+                ),
+                # Full CRUD: Glue writes TempDir shuffle spill, bookmarks, and script temp here
+                iam.PolicyStatement(
+                    sid="S3AssetsTempDir",
+                    actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+                    resources=[
+                        assets_bucket.bucket_arn,
+                        f"{assets_bucket.bucket_arn}/*",
+                    ],
+                ),
+                # PutItem + BatchWriteItem only — the Glue DynamoDB connector write mode.
+                # Replaces grant_write_data() which also granted UpdateItem, DeleteItem,
+                # GetItem, Scan, Query, ConditionCheckItem — none used by the ETL job.
+                iam.PolicyStatement(
+                    sid="DynamoDBScopedWrite",
+                    actions=["dynamodb:PutItem", "dynamodb:BatchWriteItem"],
+                    resources=[table.table_arn],
+                ),
+                iam.PolicyStatement(
+                    sid="KmsEncryptDecrypt",
+                    actions=["kms:GenerateDataKey*", "kms:Decrypt"],
+                    resources=[encryption_key.key_arn],
+                ),
+                iam.PolicyStatement(
+                    sid="SsmReadConfig",
+                    actions=["ssm:GetParameter", "ssm:GetParameters"],
+                    resources=[
+                        f"arn:aws:ssm:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:parameter/hr-pipeline/*"
+                    ],
+                ),
+                # glue:GetTable added: getSink reads the catalog schema before writing
+                # partitions to verify output schema matches registered column definitions.
+                # Without it, getSink raises AccessDeniedException before any write.
+                iam.PolicyStatement(
+                    sid="GlueCatalogPartitions",
+                    actions=["glue:GetTable", "glue:BatchCreatePartition", "glue:UpdateTable"],
+                    resources=[
+                        f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:catalog",
+                        f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:database/hr_analytics",
+                        f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:table/hr_analytics/employees",
+                    ],
+                ),
+            ],
         )
 
         # ── Glue ETL Job ─────────────────────────────────────────────────────────
