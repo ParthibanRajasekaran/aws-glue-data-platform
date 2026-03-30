@@ -1,9 +1,11 @@
 # Production-Ready Verification Report
 
 **Audit Date:** 2026-03-29
-**Account:** `664418971710`
+**Account:** `<ACCOUNT_ID>`
 **Region:** `us-east-1`
 **Method:** Black-box AWS CLI/SDK verification against live deployed resources - no console, no assumptions.
+
+> Resource names and account ID are redacted. Regenerate by running `bash deploy.sh` and inspecting `outputs.json` (local only, gitignored).
 
 ---
 
@@ -12,7 +14,7 @@
 ### 1. Data Lake Verification - S3 Raw Bucket
 
 ```
-aws s3 ls s3://hrpipelinestack-rawdatabucket57f26c03-4lhmzhvetdax/ --recursive --human-readable
+aws s3 ls s3://<RAW-BUCKET-NAME>/ --recursive --human-readable
 ```
 
 | File | Size | Last Modified | Status |
@@ -35,7 +37,7 @@ aws glue get-table --database-name hr_analytics --name employees
 |---|---|---|
 | Table Type | `EXTERNAL_TABLE` | **PASS** |
 | Storage Format | `ParquetHiveSerDe` + `SNAPPY` compression | **PASS** |
-| Location | `s3://hrpipelinestack-athenaparquetbucket7797feee-hvqxqjbplzjm/employees/` | **PASS** |
+| Location | `s3://<PARQUET-BUCKET-NAME>/employees/` | **PASS** |
 | Schema Columns | 24 enriched columns (`employeeid` → `requiresreview`) | **PASS** |
 | Partition Keys | `year (int)`, `month (int)`, `dept (string)` | **PASS** |
 | S3 Partition Files | **542 `.snappy.parquet` files** across `year/month/dept` hierarchy | **PASS** |
@@ -103,7 +105,7 @@ aws athena get-work-group --work-group hr_analytics_wg
 ### 5. Alerting Mesh - SNS Topic `hr-pipeline-alerts`
 
 ```
-aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:664418971710:hr-pipeline-alerts
+aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:<ACCOUNT_ID>:hr-pipeline-alerts
 ```
 
 Resource Policy (raw):
@@ -116,14 +118,14 @@ Resource Policy (raw):
     "Effect": "Allow",
     "Principal": { "Service": "cloudwatch.amazonaws.com" },
     "Action": "sns:Publish",
-    "Resource": "arn:aws:sns:us-east-1:664418971710:hr-pipeline-alerts"
+    "Resource": "arn:aws:sns:us-east-1:<ACCOUNT_ID>:hr-pipeline-alerts"
   }]
 }
 ```
 
 | Property | Value | Status |
 |---|---|---|
-| Topic ARN | `arn:aws:sns:us-east-1:664418971710:hr-pipeline-alerts` | **PASS** |
+| Topic ARN | `arn:aws:sns:us-east-1:<ACCOUNT_ID>:hr-pipeline-alerts` | **PASS** |
 | Resource Policy Principal | `cloudwatch.amazonaws.com` | **PASS** |
 | Permitted Action | `sns:Publish` | **PASS** |
 | Policy Effect | `Allow` | **PASS** |

@@ -141,5 +141,52 @@ class TestHandlerNotFound(unittest.TestCase):
         self.assertIn("9999", body["error"])
 
 
+# ── Tests: SSM failure at cold start ─────────────────────────────────────────
+
+class TestHandlerSsmFailure(unittest.TestCase):
+    """Module-level SSM fetch raises RuntimeError when SSM is unavailable."""
+
+    def test_ssm_failure_raises_runtime_error(self):
+        from botocore.exceptions import ClientError
+
+        failing_ssm = MagicMock()
+        failing_ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "not found"}},
+            "GetParameter",
+        )
+        import importlib.util as _ilu
+
+        with self.assertRaises(RuntimeError):
+            with patch("boto3.client", return_value=failing_ssm), \
+                 patch("boto3.resource", return_value=MagicMock()):
+                spec = _ilu.spec_from_file_location("handler_fail", _HANDLER_PATH)
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+
+
+# ── Tests: missing numeric fields ────────────────────────────────────────────
+
+class TestHandlerMissingNumericFields(unittest.TestCase):
+    """Handler returns 200 with None for missing Salary/CompaRatio fields."""
+
+    def setUp(self):
+        self._table = MagicMock()
+        _mock_dynamodb.Table.return_value = self._table
+        item_no_salary = {k: v for k, v in SAMPLE_ITEM.items()
+                          if k not in ("Salary", "CompaRatio", "HighestTitleSalary")}
+        self._table.get_item.return_value = {"Item": item_no_salary}
+
+    def test_missing_salary_returns_none_not_error(self):
+        result = handler({"employee_id": "1001"}, None)
+        self.assertEqual(result["statusCode"], 200)
+        body = json.loads(result["body"])
+        self.assertIsNone(body["Salary"])
+
+    def test_missing_compa_ratio_returns_none_not_error(self):
+        result = handler({"employee_id": "1001"}, None)
+        body = json.loads(result["body"])
+        self.assertIsNone(body["CompaRatio"])
+
+
 if __name__ == "__main__":
     unittest.main()

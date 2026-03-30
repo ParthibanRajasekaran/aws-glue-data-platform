@@ -4,13 +4,14 @@ Returns a clean employee profile JSON from DynamoDB single-table.
 Table name fetched from SSM Parameter Store at cold start (Zero-Trust).
 """
 import json
+import os
 from decimal import Decimal
 
 import boto3
 
 # ── Module-level clients — reused across warm Lambda invocations ─────────────
 # SSM fetch happens once at cold start; subsequent warm invocations skip it.
-_ssm = boto3.client("ssm", region_name="us-east-1")
+_ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
 try:
     _table_name = _ssm.get_parameter(

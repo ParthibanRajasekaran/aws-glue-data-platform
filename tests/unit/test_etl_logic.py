@@ -222,3 +222,28 @@ class TestJoins:
         df = run_etl_transformations(spark, employees, DEPARTMENTS, MANAGERS)
         row = df.collect()[0]
         assert row["ManagerName"] == "Alice Smith"
+
+    def test_null_managerid_left_join_does_not_raise(self, spark):
+        """Employee with no matching manager gets null ManagerName — no exception."""
+        employees = [
+            {"EmployeeID": "32", "DeptID": "500", "ManagerID": "9999",
+             "JobTitle": "AE", "Salary": 70000, "FirstName": "W", "LastName": "X",
+             "Email": "", "Department": "Sales", "Manager": ""},
+        ]
+        df = run_etl_transformations(spark, employees, DEPARTMENTS, MANAGERS)
+        row = df.collect()[0]
+        assert row["ManagerName"] is None
+
+
+class TestCompaRatioBoundary:
+    def test_compa_ratio_exactly_1_does_not_require_review(self, spark):
+        """salary == maxsalaryrange gives comparatio == 1.0; RequiresReview must be False."""
+        employees = [
+            {"EmployeeID": "40", "DeptID": "500", "ManagerID": "2000",
+             "JobTitle": "AE", "Salary": 100000, "FirstName": "Y", "LastName": "Z",
+             "Email": "", "Department": "Sales", "Manager": "Alice"},
+        ]
+        df = run_etl_transformations(spark, employees, DEPARTMENTS, MANAGERS)
+        row = df.collect()[0]
+        assert row["CompaRatio"] == 1.0
+        assert row["RequiresReview"] is False, "Exactly at band max should not flag RequiresReview"

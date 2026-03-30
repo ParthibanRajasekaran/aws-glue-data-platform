@@ -10,6 +10,7 @@ HR ETL PySpark Job — Phase 4
 - Null safety: na.fill() guards on all string/double columns before DynamoDB PutItem
 - Hive-partitioned Parquet output (year / month / dept) for cost-efficient Athena queries
 """
+import os
 import sys
 
 import boto3
@@ -36,7 +37,7 @@ logger = glueContext.get_logger()
 # ── Configuration from SSM Parameter Store (Zero-Trust: no hardcoded names) ──
 
 def _fetch_ssm_config() -> dict:
-    client = boto3.client("ssm", region_name="us-east-1")
+    client = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     response = client.get_parameters(
         Names=[
             "/hr-pipeline/raw-bucket-name",
@@ -194,7 +195,7 @@ failed_rules = (
 )
 if failed_rules.count() > 0:
     failed_rules.show(truncate=False)
-    raise Exception("Data quality checks failed — aborting job before any writes.")
+    raise RuntimeError("Data quality checks failed - aborting job before any writes.")
 
 # ── Step 6b: Row-level circuit breaker ────────────────────────────────────────
 # Even when aggregate rules pass, individual rows may still carry a bad
@@ -265,10 +266,6 @@ _DYNAMO_RENAME = {
 for old, new in _DYNAMO_RENAME.items():
     if old in dynamo_df.columns:
         dynamo_df = dynamo_df.withColumnRenamed(old, new)
-
-# Explicit null guard: a null DateType casts to a null StringType;
-# name the column directly rather than relying on schema inspection.
-dynamo_df = dynamo_df.na.fill("", ["hiredate"])
 
 # Null safety: DynamoDB rejects null attribute values; fill with safe defaults.
 # LEFT JOINs above can produce nulls for unmatched departments/managers rows.
