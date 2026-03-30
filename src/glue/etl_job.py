@@ -290,8 +290,11 @@ glueContext.write_dynamic_frame.from_options(
     },
 )
 
-# ── Step 8: Parquet sink — Hive-partitioned for cost-efficient Athena queries ─
-# HireDate is still DateType in `enriched`; year/month extracted before write.
+# ── Step 8: Parquet sink — catalog-aware write with automatic partition reg ───
+# getSink replaces the raw df.write.parquet() call.  With enableUpdateCatalog=True
+# and updateBehavior="UPDATE_IN_DATABASE", Glue calls glue:BatchCreatePartition
+# after each write so partitions appear in the Data Catalog immediately — no
+# MSCK REPAIR TABLE required before running Athena queries.
 parquet_df = (
     enriched
     .withColumn("year",  F.year(F.col("hiredate")))
@@ -299,12 +302,20 @@ parquet_df = (
     .withColumn("dept",  F.col("deptid"))
 )
 
-(
-    parquet_df.write
-    .mode("overwrite")
-    .partitionBy("year", "month", "dept")
-    .parquet(f"{PARQUET_BASE}/employees/")
+parquet_sink = glueContext.getSink(
+    path=f"{PARQUET_BASE}/employees/",
+    connection_type="s3",
+    updateBehavior="UPDATE_IN_DATABASE",
+    partitionKeys=["year", "month", "dept"],
+    enableUpdateCatalog=True,
+    transformation_ctx="parquet_sink",
 )
+parquet_sink.setCatalogInfo(
+    catalogDatabase="hr_analytics",
+    catalogTableName="employees",
+)
+parquet_sink.setFormat("glueparquet", useGlueParquetWriter=True)
+parquet_sink.writeFrame(DynamicFrame.fromDF(parquet_df, glueContext, "parquet_dyf"))
 
 # REQUIRED: without this Glue marks the job run as failed
 job.commit()

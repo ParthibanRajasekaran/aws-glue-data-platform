@@ -184,6 +184,20 @@ class InfrastructureStack(Stack):
                 ],
             )
         )
+        # Glue Catalog: automatic partition registration after each Parquet write.
+        # getSink with enableUpdateCatalog=True calls BatchCreatePartition +
+        # UpdateTable so Athena can query new partitions without MSCK REPAIR TABLE.
+        # Scoped to the specific catalog, database, and table — no wildcard resource.
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["glue:BatchCreatePartition", "glue:UpdateTable"],
+                resources=[
+                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:catalog",
+                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:database/hr_analytics",
+                    f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:table/hr_analytics/employees",
+                ],
+            )
+        )
 
         # ── Glue ETL Job ─────────────────────────────────────────────────────────
         # Script is read from the explicit scripts/ prefix deployed above.
