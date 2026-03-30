@@ -66,6 +66,19 @@ class InfrastructureStack(Stack):
             encryption_key=encryption_key,
         )
 
+        # Quarantine bucket — receives rows that fail the row-level DQ circuit
+        # breaker (null EmployeeID, null Salary, or negative Salary).  Kept
+        # separate from the raw and parquet buckets so poisoned data is never
+        # co-located with production inputs or outputs.
+        quarantine_bucket = s3.Bucket(
+            self,
+            "QuarantineBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=encryption_key,
+        )
+
         # ── Glue Script Deployment — explicit scripts/ prefix ────────────────────
         # Deploys src/glue/etl_job.py to s3://[assets-bucket]/scripts/etl_job.py.
         # Using BucketDeployment instead of Code.from_asset() makes the script
@@ -122,6 +135,12 @@ class InfrastructureStack(Stack):
             parameter_name="/hr-pipeline/dynamodb-table-name",
             string_value=table.table_name,
             description="DynamoDB single-table name",
+        )
+        ssm.StringParameter(
+            self, "SsmQuarantineBucketName",
+            parameter_name="/hr-pipeline/quarantine-bucket-name",
+            string_value=quarantine_bucket.bucket_name,
+            description="Quarantine bucket — receives DQ-rejected rows from the ETL job",
         )
 
         # ── IAM Role for Glue ETL Job ────────────────────────────────────────────
@@ -182,6 +201,14 @@ class InfrastructureStack(Stack):
                         "dynamodb:BatchWriteItem",
                     ],
                     resources=[table.table_arn],
+                ),
+                # PutObject only: quarantine is write-once for incident forensics.
+                # The Glue role must never be able to read back or delete
+                # quarantined rows — that right belongs to the security team.
+                iam.PolicyStatement(
+                    sid="S3QuarantineWrite",
+                    actions=["s3:PutObject"],
+                    resources=[f"{quarantine_bucket.bucket_arn}/quarantine/*"],
                 ),
                 iam.PolicyStatement(
                     sid="KmsEncryptDecrypt",
@@ -502,6 +529,10 @@ class InfrastructureStack(Stack):
             timeout=Duration.seconds(30),
         )
         table.grant_read_data(lambda_fn)
+        # grant_read_data() grants DynamoDB API actions but NOT kms:Decrypt.
+        # Without this, every GetItem call against a CUSTOMER_MANAGED-encrypted
+        # table returns KMSAccessDeniedException at runtime — a silent data gap.
+        encryption_key.grant_decrypt(lambda_fn)
         lambda_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["ssm:GetParameter"],
@@ -601,12 +632,40 @@ class InfrastructureStack(Stack):
             cloudwatch_actions.SnsAction(alerts_topic)
         )
 
+        # ── Reconciliation Mismatch Alarm ─────────────────────────────────────────
+        # The src/reconciliation/reconcile.py script publishes a custom metric
+        # HRPipeline/ReconciliationMismatch = 1 when source CSV row count and
+        # DynamoDB sink count diverge by more than 5 %.  This alarm fires within
+        # one evaluation period so on-call is paged before users notice missing
+        # records.  treat_missing_data=NOT_BREACHING: if the reconciliation
+        # script has not run yet the alarm stays green rather than INSUFFICIENT.
+        cloudwatch.Alarm(
+            self,
+            "ReconciliationMismatchAlarm",
+            alarm_name="hr-pipeline-reconciliation-mismatch",
+            alarm_description=(
+                "Source CSV row count and DynamoDB sink count diverge by > 5 %. "
+                "Run src/reconciliation/reconcile.py to inspect the gap."
+            ),
+            metric=cloudwatch.Metric(
+                namespace="HRPipeline",
+                metric_name="ReconciliationMismatch",
+                statistic="Maximum",
+                period=Duration.hours(1),
+            ),
+            threshold=0,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(cloudwatch_actions.SnsAction(alerts_topic))
+
         # ── Stack Outputs ─────────────────────────────────────────────────────────
-        cdk.CfnOutput(self, "RawBucketName",     value=raw_bucket.bucket_name)
-        cdk.CfnOutput(self, "ParquetBucketName", value=parquet_bucket.bucket_name)
-        cdk.CfnOutput(self, "AssetsBucketName",  value=assets_bucket.bucket_name)
-        cdk.CfnOutput(self, "GlueJobName",       value=glue_job.job_name)
-        cdk.CfnOutput(self, "LambdaFunctionName",value=lambda_fn.function_name)
-        cdk.CfnOutput(self, "DynamoTableName",   value=table.table_name)
-        cdk.CfnOutput(self, "KmsKeyArn",         value=encryption_key.key_arn)
-        cdk.CfnOutput(self, "AlertsTopicArn",   value=alerts_topic.topic_arn)
+        cdk.CfnOutput(self, "RawBucketName",        value=raw_bucket.bucket_name)
+        cdk.CfnOutput(self, "ParquetBucketName",    value=parquet_bucket.bucket_name)
+        cdk.CfnOutput(self, "AssetsBucketName",     value=assets_bucket.bucket_name)
+        cdk.CfnOutput(self, "QuarantineBucketName", value=quarantine_bucket.bucket_name)
+        cdk.CfnOutput(self, "GlueJobName",          value=glue_job.job_name)
+        cdk.CfnOutput(self, "LambdaFunctionName",   value=lambda_fn.function_name)
+        cdk.CfnOutput(self, "DynamoTableName",      value=table.table_name)
+        cdk.CfnOutput(self, "KmsKeyArn",            value=encryption_key.key_arn)
+        cdk.CfnOutput(self, "AlertsTopicArn",       value=alerts_topic.topic_arn)

@@ -6,7 +6,12 @@ HR ETL PySpark Job — Phase 4
   lowercases all names; mixed-case references cause AnalysisException at runtime)
 - Broadcast joins eliminate shuffle on small lookup tables
 - Silver layer: null filtering, hiredate cast
-- DQ gate: IsComplete + ColumnValues + IsUnique on employeeid — fail-fast before any write
+- DQ gate (aggregate): Completeness > 0.99, ColumnDataType, CustomSql negative-salary
+  check, IsUnique on employeeid — fail-fast before any write if systemic failure
+- DQ gate (row-level): quarantines individual bad rows to S3 so the rest of the batch
+  can proceed; poisoned rows never reach DynamoDB or the Parquet analytical sink
+- PII masking: LastName SHA-256 hashed in the Parquet analytical sink; plain-text in
+  the DynamoDB operational sink for the HR API
 - Null safety: na.fill() guards on all string/double columns before DynamoDB PutItem
 - Hive-partitioned Parquet output (year / month / dept) for cost-efficient Athena queries
 """
@@ -43,6 +48,7 @@ def _fetch_ssm_config() -> dict:
             "/hr-pipeline/raw-bucket-name",
             "/hr-pipeline/parquet-bucket-name",
             "/hr-pipeline/dynamodb-table-name",
+            "/hr-pipeline/quarantine-bucket-name",
         ],
         WithDecryption=True,
     )
@@ -52,6 +58,7 @@ def _fetch_ssm_config() -> dict:
 _ssm = _fetch_ssm_config()
 PARQUET_BASE = f"s3://{_ssm['parquet-bucket-name']}"
 DYNAMO_TABLE = _ssm["dynamodb-table-name"]
+QUARANTINE_BASE = f"s3://{_ssm['quarantine-bucket-name']}"
 
 # ── Step 1: Read source tables via Glue Catalog (enables lineage + bookmarks) ─
 # Schema is authoritative in CDK CfnTable definitions — no inferSchema scan needed.
@@ -168,10 +175,20 @@ enriched = enriched.withColumn(
 )
 
 # ── Step 6: Data Quality gate — fail-fast before writing to any sink ──────────
+# Rule rationale:
+#   Completeness > 0.99  — up to 1 % null IDs tolerated (not zero, to survive
+#     minor upstream gaps); more than that is a systemic load failure → abort.
+#   ColumnDataType        — enforces the schema contract: salary must be Double,
+#     not a string residual from a bad CSV column swap.
+#   CustomSql             — zero negative-pay values allowed; catches sign errors
+#     that a completeness check cannot (non-null but wrong sign).
+#   IsUnique              — duplicate employee IDs corrupt DynamoDB put-item
+#     semantics (last-write wins, silently overwrites).
 dq_ruleset = """
     Rules = [
-        IsComplete "employeeid",
-        ColumnValues "salary" > 0,
+        Completeness "employeeid" > 0.99,
+        ColumnDataType "salary" = "Double",
+        CustomSql "SELECT COUNT(*) FROM primary WHERE salary < 0" = 0,
         IsUnique "employeeid"
     ]
 """
@@ -197,11 +214,17 @@ if failed_rules.count() > 0:
     failed_rules.show(truncate=False)
     raise RuntimeError("Data quality checks failed - aborting job before any writes.")
 
-# ── Step 6b: Row-level circuit breaker ────────────────────────────────────────
-# Even when aggregate rules pass, individual rows may still carry a bad
-# RowOutcome (null EmployeeID or non-positive Salary). Quarantine those rows:
-# log them to CloudWatch (visible in /aws-glue/jobs/output) and exclude them
-# from the DynamoDB write so corrupt records never reach production.
+# ── Step 6b: Row-level circuit breaker — quarantine to S3 ────────────────────
+# Even when aggregate DQ rules pass, individual rows may still carry bad values
+# (null EmployeeID, null Salary, or negative Salary). These are isolated here:
+#
+#   1. Written as JSON to the dedicated quarantine bucket so the security team
+#      can inspect poisoned records without touching production sinks.
+#   2. Logged to CloudWatch (/aws-glue/jobs/output) for alerting.
+#   3. Filtered out — only clean rows reach DynamoDB and Parquet.
+#
+# Quarantine path: s3://<quarantine-bucket>/quarantine/employees/run=<job-name>/
+# The run partition uses the Glue job name so each execution is traceable.
 _bad_rows = enriched.filter(
     F.col("employeeid").isNull()
     | F.col("salary").isNull()
@@ -210,10 +233,27 @@ _bad_rows = enriched.filter(
 _bad_count = _bad_rows.count()
 if _bad_count > 0:
     logger.error(
-        f"[DQ-CircuitBreaker] RowOutcome=Error on {_bad_count} record(s). "
-        "These rows are quarantined and will NOT be written to DynamoDB."
+        f"[DQ-CircuitBreaker] RowOutcome=Quarantined on {_bad_count} record(s). "
+        f"Writing poisoned rows to {QUARANTINE_BASE}/quarantine/employees/ "
+        "— these rows will NOT reach DynamoDB or Parquet."
     )
-    _bad_rows.select("employeeid", "salary", "jobtitle").show(truncate=False)
+    # Cast hiredate back to string so JSON serialisation does not fail on DateType.
+    _quarantine_df = _bad_rows.withColumn(
+        "hiredate", F.col("hiredate").cast("string")
+    ).withColumn(
+        "_quarantine_reason",
+        F.when(F.col("employeeid").isNull(), F.lit("null_employeeid"))
+        .when(F.col("salary").isNull(), F.lit("null_salary"))
+        .otherwise(F.lit("negative_salary")),
+    )
+    glueContext.write_dynamic_frame.from_options(
+        frame=DynamicFrame.fromDF(_quarantine_df, glueContext, "quarantine_dyf"),
+        connection_type="s3",
+        connection_options={
+            "path": f"{QUARANTINE_BASE}/quarantine/employees/run={args['JOB_NAME']}/",
+        },
+        format="json",
+    )
 
 # Only rows with a clean RowOutcome proceed to both sinks.
 enriched = enriched.filter(
@@ -292,11 +332,19 @@ glueContext.write_dynamic_frame.from_options(
 # and updateBehavior="UPDATE_IN_DATABASE", Glue calls glue:BatchCreatePartition
 # after each write so partitions appear in the Data Catalog immediately — no
 # MSCK REPAIR TABLE required before running Athena queries.
+#
+# PII masking: LastName is SHA-256 hashed for the analytical sink.
+#   - Analytical consumers (Athena, BI tools) need aggregate patterns, not
+#     individual identities — hashing satisfies GDPR pseudonymisation.
+#   - The DynamoDB operational sink retains plain-text LastName for the HR API.
+#   - Salary is NOT masked: it is the primary analytical metric and is already
+#     controlled by IAM (only the Glue role and Lambda role can read the data).
 parquet_df = (
     enriched
-    .withColumn("year",  F.year(F.col("hiredate")))
-    .withColumn("month", F.month(F.col("hiredate")))
-    .withColumn("dept",  F.col("deptid"))
+    .withColumn("year",     F.year(F.col("hiredate")))
+    .withColumn("month",    F.month(F.col("hiredate")))
+    .withColumn("dept",     F.col("deptid"))
+    .withColumn("lastname", F.sha2(F.col("lastname").cast("string"), 256))
 )
 
 parquet_sink = glueContext.getSink(
