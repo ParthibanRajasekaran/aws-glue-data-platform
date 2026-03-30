@@ -1,20 +1,19 @@
-# aws-glue-demo - Serverless HR Analytics ETL Pipeline
+# aws-glue-demo - HR Analytics ETL Pipeline
 
-A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust configuration, FinOps cost controls, observability, and data governance - built with AWS CDK (Python), PySpark, and AWS Glue 4.0.
+HR compensation data typically lives across disconnected spreadsheets - raw employee records, salary bands, and manager hierarchies that nobody has joined together. This pipeline ingests those three CSV sources, enriches them with computed fields (compa-ratio, salary band position, manager activity flags), and serves the result two ways: a low-latency Lambda API for individual lookups and a partitioned Parquet data lake for Athena analytics.
+
+Built with AWS CDK (Python), PySpark on Glue 4.0, and a deliberate focus on making every infrastructure decision auditable and cost-justified.
 
 ---
 
-## Highlights
+## What was verified in production
 
-- **542 Parquet partition files** written to S3 (`year/month/dept`) - verified via AWS CLI audit
-- **0 records with Salary ≤ 0** in DynamoDB - `EvaluateDataQuality` Circuit Breaker confirmed effective
-- **100 MB Athena scan guardrail** enforced at workgroup level (`EnforceWorkGroupConfiguration: true`)
-- **Zero-Trust config** - no ARN, bucket name, or secret in source code; all via SSM Parameter Store
-- **Customer-Managed KMS** encryption on all S3 buckets and DynamoDB; annual key rotation enabled
-- **IAM least-privilege** - every statement scoped to a specific resource ARN or prefix; no `Resource: "*"`
-- **SNS alerting mesh** - `cloudwatch.amazonaws.com` principal authorized in resource policy; fires within 1 min of failure
-- **Static Glue Catalog** (CDK `CfnTable`) - no Crawler DPU spend; schema authority lives in code
-- **G.1X × 2 workers, MaxRetries=0, Timeout=5 min** - FinOps guardrails against runaway DPU spend
+- **542 Parquet partition files** written to S3 (`year/month/dept`) - confirmed via AWS CLI audit
+- **0 records with Salary <= 0** reached DynamoDB - `EvaluateDataQuality` circuit breaker confirmed effective across 1,000 scanned items
+- **100 MB Athena scan guardrail** enforced at workgroup level, cannot be overridden per session
+- **Zero hardcoded resource names** in source code - all config fetched from SSM at runtime
+
+See [VERIFICATION.md](VERIFICATION.md) for the full CLI audit trail and the three production bugs that were root-caused and fixed during the build.
 
 ---
 
@@ -27,8 +26,6 @@ A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust conf
 ### Data Access - KMS Encryption & SSM Zero-Trust Config
 
 ![Data Access Architecture](docs/images/data-access.png)
-
----
 
 ### Data Model - Raw CSV to Dual Sink
 
@@ -77,122 +74,15 @@ flowchart TD
 
 ---
 
-## FinOps Strategy
+## Deep dives
 
-Cost was a first-class design constraint. Every decision has a price tag.
-
-| Decision | Rationale | Monthly savings vs. default |
-|---|---|---|
-| **G.1X workers (2×)** | Minimum viable worker size for batch PySpark ETL. G.2X doubles DPU cost with no throughput benefit at 1,000-row scale. | ~$0.11/run |
-| **`MaxRetries = 0`** | Runaway retries on a misconfigured job would silently double or triple DPU spend. Fail fast; alert; fix. | Up to 2× DPU savings |
-| **`Timeout = 5 min`** | Hard kill at 5 minutes prevents a hung Spark stage from accumulating DPU-hours. | Unbounded protection |
-| **Athena 100 MB scan cap** | `BytesScannedCutoffPerQuery = 104857600` on `hr_analytics_wg`. Ad-hoc queries against the wrong (unpartitioned) table cannot scan the full dataset. | Depends on query; cap prevents surprises |
-| **Hive partitioning (year/month/dept)** | Athena prunes partitions at query time. A query scoped to one department and one month reads ~1/72 of the dataset. | Up to 98% Athena cost reduction |
-| **Static Glue Catalog (no Crawler)** | Crawlers run on a schedule, consume DPUs, and cost ~$0.44/hour. Schema authority lives in CDK `CfnTable` definitions - free at synth time. | ~$0.44/crawl eliminated |
-| **CloudWatch Alarm (~$0.10/month)** | Early detection prevents a silent pipeline failure from persisting for days, which would require a costly backfill run. | Pays for itself on first incident |
-
----
-
-## Security
-
-### Encryption at rest and in transit
-
-All S3 buckets are encrypted with a **Customer-Managed KMS Key** (annual rotation enabled). DynamoDB uses AWS-managed KMS:
-
-| Resource | Encryption |
+| Topic | What's covered |
 |---|---|
-| S3 raw bucket | SSE-KMS (pipeline key) |
-| S3 Parquet bucket | SSE-KMS (pipeline key) |
-| S3 assets bucket (Glue TempDir) | SSE-KMS (pipeline key) |
-| DynamoDB single-table | AWS-managed KMS (`TableEncryption.AWS_MANAGED`) |
-
-### Zero-Trust configuration discovery
-
-No resource name, ARN, or secret appears in source code or in environment variables. All runtime configuration is fetched from **SSM Parameter Store** at startup:
-
-| SSM Path | Consumer | Purpose |
-|---|---|---|
-| `/hr-pipeline/dynamodb-table-name` | Glue ETL, Lambda | DynamoDB table for sink and read API |
-| `/hr-pipeline/parquet-bucket-name` | Glue ETL | S3 output path for Parquet sink |
-| `/hr-pipeline/raw-bucket-name` | Ops runbooks | Raw CSV source bucket |
-| `/hr-pipeline/kms-key-arn` | Audit tooling | KMS key for encryption verification |
-
-See [docs/ADR/001-configuration-management.md](docs/ADR/001-configuration-management.md) for the full decision record.
-
-### IAM least-privilege
-
-No `Resource: "*"` exists in any custom IAM statement.
-
-| Principal | Actions | Scoped to |
-|---|---|---|
-| Glue job role | `s3:GetObject`, `s3:ListBucket` | `raw_bucket/raw/*` prefix only |
-| Glue job role | `s3:PutObject`, `s3:DeleteObject` | `parquet_bucket/employees*` prefix |
-| Glue job role | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` | `assets_bucket/*` (TempDir + script) |
-| Glue job role | `dynamodb:DescribeTable`, `dynamodb:PutItem`, `dynamodb:BatchWriteItem` | `aws-glue-demo-single-table` only |
-| Glue job role | `kms:GenerateDataKey*`, `kms:Decrypt` | Specific pipeline KMS key ARN |
-| Glue job role | `ssm:GetParameter`, `ssm:GetParameters` | `/hr-pipeline/*` prefix |
-| Glue job role | `glue:GetTable`, `glue:BatchCreatePartition`, `glue:UpdateTable` | `hr_analytics` DB + `employees` table only |
-| Lambda role | `dynamodb:GetItem` | `aws-glue-demo-single-table` only |
-| Lambda role | `ssm:GetParameter` | `/hr-pipeline/dynamodb-table-name` only |
-
----
-
-## Data Quality & Governance
-
-The pipeline enforces a two-tier quality strategy:
-
-**Tier 1 - Rule-level gate (fail-fast):**
-`EvaluateDataQuality` checks three rules before any write. A single failure aborts the job - no partial data reaches DynamoDB or Parquet.
-
-```
-IsComplete "employeeid"
-ColumnValues "salary" > 0
-IsUnique "employeeid"
-```
-
-**Tier 2 - Row-level circuit breaker:**
-Even when aggregate rules pass, individual rows with a `RowOutcome=Error` (null `EmployeeID` or non-positive `Salary`) are quarantined. They are logged to CloudWatch (`/aws-glue/jobs/output`) and excluded from the DynamoDB write. Clean records proceed normally.
-
----
-
-## Observability
-
-| Signal | Implementation |
-|---|---|
-| **CloudWatch Dashboard** `hr-pipeline-observability` | Glue succeeded/failed task counts + Athena bytes scanned per query |
-| **CloudWatch Alarm** `hr-pipeline-glue-job-failed` | Fires within 1 minute when `numFailedTasks > 0` |
-| **SNS Topic** `hr-pipeline-alerts` | Alarm action target - subscribe an email or PagerDuty endpoint to receive alerts |
-| **Glue DQ Results** | Published to the Glue Data Quality console under context `hr_etl_dq` |
-| **CloudWatch Logs** `/aws-glue/jobs/output` | Circuit breaker quarantine logs (1-day retention) |
-
----
-
-## Single-Table Design
-
-All employee records live in one DynamoDB table with a composite key:
-
-| Attribute | Value |
-|---|---|
-| `PK` | `EMP#<EmployeeID>` |
-| `SK` | `PROFILE` |
-
-**Key computed fields:**
-
-| Field | Formula |
-|---|---|
-| `CompaRatio` | `ROUND(Salary / MaxSalaryRange, 2)` |
-| `HighestTitleSalary` | `MAX(Salary) OVER (PARTITION BY JobTitle)` |
-| `RequiresReview` | `CompaRatio > 1.0 OR IsActive == "False"` |
-
----
-
-## Source Data
-
-| File | Rows | Key Fields |
-|---|---|---|
-| `employee_data_updated.csv` | 1,000 | EmployeeID, DeptID, ManagerID, Salary |
-| `departments_data.csv` | 6 | DeptID, MaxSalaryRange, MinSalaryRange, Budget |
-| `managers_data.csv` | 100 | ManagerID, IsActive, Level |
+| [FinOps Strategy](docs/FINOPS.md) | Worker sizing, retry policy, Athena cost controls, why MaxRetries=0 is the right call |
+| [Security](docs/SECURITY.md) | KMS encryption, SSM Zero-Trust config, IAM least-privilege statement-by-statement |
+| [Data Quality & Governance](docs/DATA-QUALITY.md) | Two-tier DQ strategy, circuit breaker, what the CloudWatch alarm does and doesn't catch |
+| [Athena Queries](docs/ATHENA-QUERIES.md) | Business-oriented queries with partition-aware patterns |
+| [ADR 001 - Configuration Management](docs/ADR/001-configuration-management.md) | Why SSM over environment variables |
 
 ---
 
@@ -219,7 +109,7 @@ Steps performed automatically:
 5. Upload the 3 CSVs to the raw S3 bucket
 6. Start the Glue ETL job
 
-Monitor the Glue job (~3–5 min):
+Monitor the Glue job (3-5 min):
 ```bash
 aws glue get-job-run \
   --job-name $(jq -r '.HrPipelineStack.GlueJobName' outputs.json) \
@@ -254,35 +144,7 @@ Expected response:
 
 ---
 
-## Athena Queries
-
-```sql
--- All employees
-SELECT * FROM hr_analytics.employees LIMIT 10;
-
--- Employees flagged for review
-SELECT employeeid, firstname, lastname, jobtitle, comparatio
-FROM hr_analytics.employees
-WHERE requiresreview = true
-ORDER BY comparatio DESC;
-
--- Average salary by department
-SELECT departmentname, ROUND(AVG(salary), 0) AS avg_salary, COUNT(*) AS headcount
-FROM hr_analytics.employees
-GROUP BY departmentname
-ORDER BY avg_salary DESC;
-
--- Top earners per department
-SELECT departmentname, firstname, lastname, salary, comparatio
-FROM hr_analytics.employees
-WHERE year = 2024
-ORDER BY salary DESC
-LIMIT 20;
-```
-
----
-
-## Running Tests
+## Tests
 
 ```bash
 # Lambda handler (no AWS required)
@@ -315,9 +177,13 @@ aws-glue-demo/
 ├── docs/
 │   ├── ADR/
 │   │   └── 001-configuration-management.md
-│   └── images/
-│       ├── workflow.png
-│       └── data-access.png
+│   ├── images/
+│   │   ├── workflow.png
+│   │   └── data-access.png
+│   ├── FINOPS.md
+│   ├── SECURITY.md
+│   ├── DATA-QUALITY.md
+│   └── ATHENA-QUERIES.md
 ├── infrastructure/
 │   ├── app.py
 │   ├── infrastructure_stack.py
@@ -333,7 +199,7 @@ aws-glue-demo/
 │   └── e2e/
 │       └── test_pipeline_e2e.py
 ├── README.md
-├── README_TECHNICAL.md        ← data contract & technical spec
+├── VERIFICATION.md
 ├── deploy.sh
 └── verify_api.sh
 ```
