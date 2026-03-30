@@ -20,52 +20,59 @@ A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust conf
 
 ## Architecture
 
+### Pipeline Overview
+
+![Pipeline Architecture](docs/images/workflow.png)
+
+### Data Access — KMS Encryption & SSM Zero-Trust Config
+
+![Data Access Architecture](docs/images/data-access.png)
+
+---
+
+### Data Model — Raw CSV to Dual Sink
+
 ```mermaid
 flowchart TD
-    subgraph Ingestion ["Ingestion Layer"]
-        direction LR
-        S3A["S3 Assets Bucket\nCDK bootstrap artifact store"]
-        S3R["S3 Raw Bucket\nraw/employees/\nraw/managers/\nraw/departments/"]
-        S3A -->|"deploy.sh · aws s3 cp"| S3R
+    subgraph Source["Source Layer — S3 Raw Bucket"]
+        EMP["📄 employees.csv\nemployeeid · firstname · lastname · email\ndeptid · managerid · jobtitle · salary\nhiredate · city · state · employmentstatus"]
+        DEPT["📄 departments.csv\ndeptid · departmentname\nmaxsalaryrange · minsalaryrange · budget"]
+        MGR["📄 managers.csv\nmanagerid · managername · isactive · level"]
     end
 
-    subgraph Transform ["Transform · AWS Glue 4.0 · PySpark · G.1X × 2 workers"]
-        direction TB
-        CAT["Glue Data Catalog\nhr_analytics DB\nStatic CfnTable — no Crawler"]
-        SSM["SSM Parameter Store\n/hr-pipeline/*\nZero-Trust runtime config"]
-        ETL["etl_job.py\nBroadcast joins × 2\nWindow fn: CompaRatio · HighestTitleSalary\nRequiresReview flag"]
-        DQ["EvaluateDataQuality\nGlue 4.0 built-in transform\nIsComplete · ColumnValues > 0 · IsUnique"]
-        CB["Circuit Breaker\nRowOutcome=Error → quarantine log\nClean rows only proceed to sinks"]
-        ABORT["Job Abort\nNo partial write to any sink"]
-        CAT --> ETL
-        SSM --> ETL
-        ETL --> DQ
-        DQ -->|"All rules PASS"| CB
-        DQ -->|"Any rule FAILS"| ABORT
+    subgraph Catalog["Glue Data Catalog — hr_analytics"]
+        CT["CfnTable schema authority\nraw_employees · raw_departments · raw_managers\nAll columns lowercase · Format: CSV"]
     end
 
-    subgraph Serve ["Serving Layer"]
-        DDB["DynamoDB · Single-Table Design\nPK: EMP#id · SK: PROFILE\nComputed: CompaRatio · HighestTitleSalary · RequiresReview\nEncrypted: AWS-managed KMS"]
-        PQ["S3 Parquet Bucket · Partitioned Parquet\nHive layout: year= / month= / dept=\n542 files · SNAPPY compressed\nEncrypted: SSE-KMS (pipeline key)"]
-        API["Lambda · Python 3.12\nEmployee Profile API\nReads DynamoDB GetItem"]
+    subgraph Transform["PySpark Transform — etl_job.py"]
+        LC["① _lowercase_columns()\nNormalise all column names to lowercase"]
+        J1["② Broadcast JOIN\nemployees ⟕ departments ON deptid\n+ departmentname · maxsalaryrange · minsalaryrange · budget"]
+        J2["③ Broadcast JOIN\nenriched ⟕ managers ON managerid\n+ managername · isactive · level"]
+        WIN["④ Window Function\nMAX salary OVER PARTITION BY jobtitle\n→ highesttitlesalary"]
+        CALC["⑤ Derived Columns\ncomparatio = ROUND salary / maxsalaryrange, 2\nrequiresreview = comparatio > 1.0 OR isactive = False"]
+        DQ["⑥ EvaluateDataQuality Gate\nIsComplete employeeid · ColumnValues salary > 0 · IsUnique employeeid\nFail-fast — no partial write on rule failure"]
+        TC["⑦ TitleCase Remapping\nemployeeid → EmployeeID · salary → Salary\nlevel → ManagerLevel · 24 columns total\nRestores API contract after internal lowercase processing"]
     end
 
-    subgraph Governance ["Governance · Cost Controls · Alerting"]
-        ATH["Amazon Athena\nWorkgroup: hr_analytics_wg\n100 MB scan guardrail\nEnforceWorkGroupConfiguration: true"]
-        CW["CloudWatch\nDashboard: hr-pipeline-observability\nAlarm: numFailedTasks > 0 · 1-min period"]
-        SNS["SNS Topic: hr-pipeline-alerts\nResource Policy:\nprincipal: cloudwatch.amazonaws.com\naction: sns:Publish"]
-        KMS["Customer-Managed KMS Key\nAnnual rotation enabled\nAll S3 buckets + DynamoDB"]
+    subgraph DDB["DynamoDB — Operational Sink"]
+        DDB_MODEL["Single-Table Design\nPK: EMP#employeeid   SK: PROFILE\n─────────────────────────────\nEmployeeID · FirstName · LastName · Email\nJobTitle · Salary · HireDate · City · State\nDepartmentName · ManagerName · ManagerLevel\nCompaRatio · HighestTitleSalary · RequiresReview\n─────────────────────────────\nAccess pattern: GetItem by EMP#id → Lambda API"]
     end
 
-    S3R --> CAT
-    CB -->|"DynamicFrame · BatchWriteItem"| DDB
-    CB -->|"partitionBy(year, month, dept)"| PQ
-    DDB --> API
-    PQ --> ATH
-    ETL -->|"numFailedTasks > 0"| CW
-    CW -->|"ALARM state"| SNS
-    KMS -. "SSE-KMS" .-> PQ
-    KMS -. "SSE-KMS" .-> S3R
+    subgraph PQ["S3 Parquet — Analytical Sink"]
+        PQ_MODEL["Hive-Partitioned Parquet\nyear= / month= / dept=\n─────────────────────────────\nAll 24 enriched columns · SNAPPY compressed\nPartitions auto-registered in Glue Catalog\n─────────────────────────────\nAccess pattern: Athena SQL · 100 MB scan guardrail"]
+    end
+
+    Source --> Catalog
+    Catalog --> LC
+    LC --> J1
+    J1 --> J2
+    J2 --> WIN
+    WIN --> CALC
+    CALC --> DQ
+    DQ -->|"All rules PASS"| TC
+    DQ -->|"Any rule FAILS"| ABORT["🚫 Job Abort\nNo write to either sink"]
+    TC --> DDB_MODEL
+    DQ -->|"Clean rows only\nafter circuit breaker"| PQ_MODEL
 ```
 
 ---
