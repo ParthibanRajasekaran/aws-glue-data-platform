@@ -1,20 +1,20 @@
-# aws-glue-demo — Serverless HR Analytics ETL Pipeline
+# aws-glue-demo - Serverless HR Analytics ETL Pipeline
 
-A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust configuration, FinOps cost controls, observability, and data governance — built with AWS CDK (Python), PySpark, and AWS Glue 4.0.
+A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust configuration, FinOps cost controls, observability, and data governance - built with AWS CDK (Python), PySpark, and AWS Glue 4.0.
 
 ---
 
 ## Highlights
 
-- **542 Parquet partition files** written to S3 (`year/month/dept`) — verified via AWS CLI audit
-- **0 records with Salary ≤ 0** in DynamoDB — `EvaluateDataQuality` Circuit Breaker confirmed effective
+- **542 Parquet partition files** written to S3 (`year/month/dept`) - verified via AWS CLI audit
+- **0 records with Salary ≤ 0** in DynamoDB - `EvaluateDataQuality` Circuit Breaker confirmed effective
 - **100 MB Athena scan guardrail** enforced at workgroup level (`EnforceWorkGroupConfiguration: true`)
-- **Zero-Trust config** — no ARN, bucket name, or secret in source code; all via SSM Parameter Store
+- **Zero-Trust config** - no ARN, bucket name, or secret in source code; all via SSM Parameter Store
 - **Customer-Managed KMS** encryption on all S3 buckets and DynamoDB; annual key rotation enabled
-- **IAM least-privilege** — every statement scoped to a specific resource ARN or prefix; no `Resource: "*"`
-- **SNS alerting mesh** — `cloudwatch.amazonaws.com` principal authorized in resource policy; fires within 1 min of failure
-- **Static Glue Catalog** (CDK `CfnTable`) — no Crawler DPU spend; schema authority lives in code
-- **G.1X × 2 workers, MaxRetries=0, Timeout=5 min** — FinOps guardrails against runaway DPU spend
+- **IAM least-privilege** - every statement scoped to a specific resource ARN or prefix; no `Resource: "*"`
+- **SNS alerting mesh** - `cloudwatch.amazonaws.com` principal authorized in resource policy; fires within 1 min of failure
+- **Static Glue Catalog** (CDK `CfnTable`) - no Crawler DPU spend; schema authority lives in code
+- **G.1X × 2 workers, MaxRetries=0, Timeout=5 min** - FinOps guardrails against runaway DPU spend
 
 ---
 
@@ -24,41 +24,41 @@ A production-grade, serverless ETL pipeline on AWS demonstrating Zero-Trust conf
 
 ![Pipeline Architecture](docs/images/workflow.png)
 
-### Data Access — KMS Encryption & SSM Zero-Trust Config
+### Data Access - KMS Encryption & SSM Zero-Trust Config
 
 ![Data Access Architecture](docs/images/data-access.png)
 
 ---
 
-### Data Model — Raw CSV to Dual Sink
+### Data Model - Raw CSV to Dual Sink
 
 ```mermaid
 flowchart TD
-    subgraph Source["Source Layer — S3 Raw Bucket"]
+    subgraph Source["Source Layer - S3 Raw Bucket"]
         EMP["📄 employees.csv\nemployeeid · firstname · lastname · email\ndeptid · managerid · jobtitle · salary\nhiredate · city · state · employmentstatus"]
         DEPT["📄 departments.csv\ndeptid · departmentname\nmaxsalaryrange · minsalaryrange · budget"]
         MGR["📄 managers.csv\nmanagerid · managername · isactive · level"]
     end
 
-    subgraph Catalog["Glue Data Catalog — hr_analytics"]
+    subgraph Catalog["Glue Data Catalog - hr_analytics"]
         CT["CfnTable schema authority\nraw_employees · raw_departments · raw_managers\nAll columns lowercase · Format: CSV"]
     end
 
-    subgraph Transform["PySpark Transform — etl_job.py"]
+    subgraph Transform["PySpark Transform - etl_job.py"]
         LC["① _lowercase_columns()\nNormalise all column names to lowercase"]
         J1["② Broadcast JOIN\nemployees ⟕ departments ON deptid\n+ departmentname · maxsalaryrange · minsalaryrange · budget"]
         J2["③ Broadcast JOIN\nenriched ⟕ managers ON managerid\n+ managername · isactive · level"]
         WIN["④ Window Function\nMAX salary OVER PARTITION BY jobtitle\n→ highesttitlesalary"]
         CALC["⑤ Derived Columns\ncomparatio = ROUND salary / maxsalaryrange, 2\nrequiresreview = comparatio > 1.0 OR isactive = False"]
-        DQ["⑥ EvaluateDataQuality Gate\nIsComplete employeeid · ColumnValues salary > 0 · IsUnique employeeid\nFail-fast — no partial write on rule failure"]
+        DQ["⑥ EvaluateDataQuality Gate\nIsComplete employeeid · ColumnValues salary > 0 · IsUnique employeeid\nFail-fast - no partial write on rule failure"]
         TC["⑦ TitleCase Remapping\nemployeeid → EmployeeID · salary → Salary\nlevel → ManagerLevel · 24 columns total\nRestores API contract after internal lowercase processing"]
     end
 
-    subgraph DDB["DynamoDB — Operational Sink"]
+    subgraph DDB["DynamoDB - Operational Sink"]
         DDB_MODEL["Single-Table Design\nPK: EMP#employeeid   SK: PROFILE\n─────────────────────────────\nEmployeeID · FirstName · LastName · Email\nJobTitle · Salary · HireDate · City · State\nDepartmentName · ManagerName · ManagerLevel\nCompaRatio · HighestTitleSalary · RequiresReview\n─────────────────────────────\nAccess pattern: GetItem by EMP#id → Lambda API"]
     end
 
-    subgraph PQ["S3 Parquet — Analytical Sink"]
+    subgraph PQ["S3 Parquet - Analytical Sink"]
         PQ_MODEL["Hive-Partitioned Parquet\nyear= / month= / dept=\n─────────────────────────────\nAll 24 enriched columns · SNAPPY compressed\nPartitions auto-registered in Glue Catalog\n─────────────────────────────\nAccess pattern: Athena SQL · 100 MB scan guardrail"]
     end
 
@@ -88,7 +88,7 @@ Cost was a first-class design constraint. Every decision has a price tag.
 | **`Timeout = 5 min`** | Hard kill at 5 minutes prevents a hung Spark stage from accumulating DPU-hours. | Unbounded protection |
 | **Athena 100 MB scan cap** | `BytesScannedCutoffPerQuery = 104857600` on `hr_analytics_wg`. Ad-hoc queries against the wrong (unpartitioned) table cannot scan the full dataset. | Depends on query; cap prevents surprises |
 | **Hive partitioning (year/month/dept)** | Athena prunes partitions at query time. A query scoped to one department and one month reads ~1/72 of the dataset. | Up to 98% Athena cost reduction |
-| **Static Glue Catalog (no Crawler)** | Crawlers run on a schedule, consume DPUs, and cost ~$0.44/hour. Schema authority lives in CDK `CfnTable` definitions — free at synth time. | ~$0.44/crawl eliminated |
+| **Static Glue Catalog (no Crawler)** | Crawlers run on a schedule, consume DPUs, and cost ~$0.44/hour. Schema authority lives in CDK `CfnTable` definitions - free at synth time. | ~$0.44/crawl eliminated |
 | **CloudWatch Alarm (~$0.10/month)** | Early detection prevents a silent pipeline failure from persisting for days, which would require a costly backfill run. | Pays for itself on first incident |
 
 ---
@@ -139,8 +139,8 @@ No `Resource: "*"` exists in any custom IAM statement.
 
 The pipeline enforces a two-tier quality strategy:
 
-**Tier 1 — Rule-level gate (fail-fast):**
-`EvaluateDataQuality` checks three rules before any write. A single failure aborts the job — no partial data reaches DynamoDB or Parquet.
+**Tier 1 - Rule-level gate (fail-fast):**
+`EvaluateDataQuality` checks three rules before any write. A single failure aborts the job - no partial data reaches DynamoDB or Parquet.
 
 ```
 IsComplete "EmployeeID"
@@ -148,7 +148,7 @@ ColumnValues "Salary" > 0
 IsUnique "EmployeeID"
 ```
 
-**Tier 2 — Row-level circuit breaker:**
+**Tier 2 - Row-level circuit breaker:**
 Even when aggregate rules pass, individual rows with a `RowOutcome=Error` (null `EmployeeID` or non-positive `Salary`) are quarantined. They are logged to CloudWatch (`/aws-glue/jobs/output`) and excluded from the DynamoDB write. Clean records proceed normally.
 
 ---
@@ -159,7 +159,7 @@ Even when aggregate rules pass, individual rows with a `RowOutcome=Error` (null 
 |---|---|
 | **CloudWatch Dashboard** `hr-pipeline-observability` | Glue succeeded/failed task counts + Athena bytes scanned per query |
 | **CloudWatch Alarm** `hr-pipeline-glue-job-failed` | Fires within 1 minute when `numFailedTasks > 0` |
-| **SNS Topic** `hr-pipeline-alerts` | Alarm action target — subscribe an email or PagerDuty endpoint to receive alerts |
+| **SNS Topic** `hr-pipeline-alerts` | Alarm action target - subscribe an email or PagerDuty endpoint to receive alerts |
 | **Glue DQ Results** | Published to the Glue Data Quality console under context `hr_etl_dq` |
 | **CloudWatch Logs** `/aws-glue/jobs/output` | Circuit breaker quarantine logs (1-day retention) |
 

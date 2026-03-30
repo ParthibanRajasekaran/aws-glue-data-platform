@@ -3,13 +3,13 @@
 **Audit Date:** 2026-03-29
 **Account:** `664418971710`
 **Region:** `us-east-1`
-**Method:** Black-box AWS CLI/SDK verification against live deployed resources — no console, no assumptions.
+**Method:** Black-box AWS CLI/SDK verification against live deployed resources - no console, no assumptions.
 
 ---
 
 ## System-Ready Checks
 
-### 1. Data Lake Verification — S3 Raw Bucket
+### 1. Data Lake Verification - S3 Raw Bucket
 
 ```
 aws s3 ls s3://hrpipelinestack-rawdatabucket57f26c03-4lhmzhvetdax/ --recursive --human-readable
@@ -21,11 +21,11 @@ aws s3 ls s3://hrpipelinestack-rawdatabucket57f26c03-4lhmzhvetdax/ --recursive -
 | `raw/managers/managers_data.csv` | 7.0 KiB | 2026-03-29 17:32 | **PRESENT** |
 | `raw/departments/departments_data.csv` | 321 B | 2026-03-29 17:32 | **PRESENT** |
 
-**Result: PASS** — All 3 source files confirmed in `raw/` prefix.
+**Result: PASS** - All 3 source files confirmed in `raw/` prefix.
 
 ---
 
-### 2. Glue Catalog Audit — `hr_analytics.employees`
+### 2. Glue Catalog Audit - `hr_analytics.employees`
 
 ```
 aws glue get-table --database-name hr_analytics --name employees
@@ -40,13 +40,13 @@ aws glue get-table --database-name hr_analytics --name employees
 | Partition Keys | `year (int)`, `month (int)`, `dept (string)` | **PASS** |
 | S3 Partition Files | **542 `.snappy.parquet` files** across `year/month/dept` hierarchy | **PASS** |
 
-**Result: PASS** — Schema is fully enriched (raw CSV + manager + department joins). 542 partition files physically present in S3 and queryable by Athena.
+**Result: PASS** - Schema is fully enriched (raw CSV + manager + department joins). 542 partition files physically present in S3 and queryable by Athena.
 
-> Note: `get-partitions` returns 0 because the Glue job writes partitions directly to S3 without calling `MSCK REPAIR TABLE`. This is expected — Athena discovers them at query time via the partition scheme registered in the catalog.
+> Note: `get-partitions` returns 0 because the Glue job writes partitions directly to S3 without calling `MSCK REPAIR TABLE`. This is expected - Athena discovers them at query time via the partition scheme registered in the catalog.
 
 ---
 
-### 3. DynamoDB Final State — `aws-glue-demo-single-table`
+### 3. DynamoDB Final State - `aws-glue-demo-single-table`
 
 ```
 aws dynamodb scan --table-name aws-glue-demo-single-table --limit 5 \
@@ -77,11 +77,11 @@ aws dynamodb scan --table-name aws-glue-demo-single-table \
 | Items scanned | 1,000 |
 | Items matching `Salary <= 0` | **0** |
 
-**Result: PASS** — `HireDate` is populated on all sampled records. Zero records with `Salary ≤ 0` confirm the `EvaluateDataQuality` Circuit Breaker successfully quarantined all invalid rows before any write reached DynamoDB.
+**Result: PASS** - `HireDate` is populated on all sampled records. Zero records with `Salary ≤ 0` confirm the `EvaluateDataQuality` Circuit Breaker successfully quarantined all invalid rows before any write reached DynamoDB.
 
 ---
 
-### 4. Athena Workgroup Safety — `hr_analytics_wg`
+### 4. Athena Workgroup Safety - `hr_analytics_wg`
 
 ```
 aws athena get-work-group --work-group hr_analytics_wg
@@ -96,11 +96,11 @@ aws athena get-work-group --work-group hr_analytics_wg
 | Engine Version | `Athena engine version 3` | **PASS** |
 | Results Location | `s3://.../athena-results/` | **PASS** |
 
-**Result: PASS** — Hard 100 MB scan cutoff is enforced at the workgroup level. Individual users/sessions cannot override it (`EnforceWorkGroupConfiguration: true`).
+**Result: PASS** - Hard 100 MB scan cutoff is enforced at the workgroup level. Individual users/sessions cannot override it (`EnforceWorkGroupConfiguration: true`).
 
 ---
 
-### 5. Alerting Mesh — SNS Topic `hr-pipeline-alerts`
+### 5. Alerting Mesh - SNS Topic `hr-pipeline-alerts`
 
 ```
 aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:664418971710:hr-pipeline-alerts
@@ -128,7 +128,7 @@ Resource Policy (raw):
 | Permitted Action | `sns:Publish` | **PASS** |
 | Policy Effect | `Allow` | **PASS** |
 
-**Result: PASS** — CloudWatch Alarms are authorized to publish to this topic. The alerting mesh is live and correctly scoped to CloudWatch only (no wildcard principal).
+**Result: PASS** - CloudWatch Alarms are authorized to publish to this topic. The alerting mesh is live and correctly scoped to CloudWatch only (no wildcard principal).
 
 ---
 
@@ -148,13 +148,13 @@ Resource Policy (raw):
 
 ---
 
-## Operational Resilience — Root-Cause Fix Log
+## Operational Resilience - Root-Cause Fix Log
 
 Three production-blocking defects were identified, root-caused, and resolved during the build phase. Each fix is described below with its symptom, root cause, and the change made.
 
 ---
 
-### Fix G.1 — Worker Type: G.1X (DPU Right-Sizing)
+### Fix G.1 - Worker Type: G.1X (DPU Right-Sizing)
 
 **Symptom:** Glue job failed to start with a capacity error; the CDK stack defaulted to a worker type that was incompatible with the specified DPU count.
 
@@ -166,7 +166,7 @@ Three production-blocking defects were identified, root-caused, and resolved dur
 
 ---
 
-### Fix G.2 — DQ Package Import Path (Glue 4.0 Compatibility)
+### Fix G.2 - DQ Package Import Path (Glue 4.0 Compatibility)
 
 **Symptom:** Glue job failed immediately at startup with an `ImportError` on the `EvaluateDataQuality` transform. The job ran successfully locally but failed in the Glue 4.0 managed environment.
 
@@ -175,7 +175,7 @@ Three production-blocking defects were identified, root-caused, and resolved dur
 **Fix:** Updated the import statement in `src/glue/etl_job.py`:
 
 ```python
-# Before (Glue 3.0 path — broken in 4.0)
+# Before (Glue 3.0 path - broken in 4.0)
 from awsglue.transforms import EvaluateDataQuality
 
 # After (Glue 4.0 correct path)
@@ -186,12 +186,12 @@ from awsgluedq.transforms import EvaluateDataQuality
 
 ---
 
-### Fix G.3 — S3 IAM Scope (Hadoop Folder Marker Objects)
+### Fix G.3 - S3 IAM Scope (Hadoop Folder Marker Objects)
 
 **Symptom:** The Glue job completed the PySpark transform and began writing Parquet to S3 but failed mid-write with an `AccessDenied` error. The DQ checks passed, the Circuit Breaker ran cleanly, but no files reached S3.
 
-**Root Cause:** The IAM policy on the Glue job role scoped `s3:PutObject` to `parquet_bucket/employees/*` only. When PySpark writes Parquet via the Hadoop S3A connector, it first writes empty folder marker objects (e.g., `employees/year=2016/`) to establish the directory hierarchy before writing the actual `.parquet` files. These marker objects fall outside the `employees/*` prefix — they land at the `employees/` key itself — triggering `AccessDenied`.
+**Root Cause:** The IAM policy on the Glue job role scoped `s3:PutObject` to `parquet_bucket/employees/*` only. When PySpark writes Parquet via the Hadoop S3A connector, it first writes empty folder marker objects (e.g., `employees/year=2016/`) to establish the directory hierarchy before writing the actual `.parquet` files. These marker objects fall outside the `employees/*` prefix - they land at the `employees/` key itself - triggering `AccessDenied`.
 
 **Fix:** Broadened the `s3:PutObject` scope in `infrastructure_stack.py` from `employees/*` to `employees*` (removing the slash), allowing both the folder markers at `employees/year=.../` and the data files at `employees/year=.../dept=.../part-*.parquet` to be written.
 
-**Security note:** The scope remains tightly bounded — the `*` wildcard only covers the `employees` prefix within this specific bucket ARN. No other bucket or prefix is affected. This is still least-privilege; it simply accounts for the Hadoop S3A write protocol.
+**Security note:** The scope remains tightly bounded - the `*` wildcard only covers the `employees` prefix within this specific bucket ARN. No other bucket or prefix is affected. This is still least-privilege; it simply accounts for the Hadoop S3A write protocol.

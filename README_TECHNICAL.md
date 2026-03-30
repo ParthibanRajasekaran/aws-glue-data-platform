@@ -1,5 +1,5 @@
 # Technical Specification & Data Contract
-## HR Analytics ETL Pipeline — Phase 4
+## HR Analytics ETL Pipeline - Phase 4
 
 ---
 
@@ -11,7 +11,7 @@
 |---|---|
 | **Zero-Trust Config** | No resource names or ARNs in source code. All runtime config fetched from SSM Parameter Store at job start. |
 | **FinOps** | `G.1X` workers (minimum for batch ETL), `MaxRetries=0`, `Timeout=5 min`, Athena 100 MB scan cap per query. |
-| **Governance** | Schema authority lives in CDK `CfnTable` definitions — not inferred at runtime. Static catalog eliminates the Glue Crawler cost. |
+| **Governance** | Schema authority lives in CDK `CfnTable` definitions - not inferred at runtime. Static catalog eliminates the Glue Crawler cost. |
 | **Data Lineage** | `from_catalog()` reads activate the native Glue Data Lineage graph, tracing data S3 → DynamoDB and S3 → Parquet end-to-end. |
 | **Fail-Fast Quality** | `EvaluateDataQuality` gate runs before any write. A single failed rule aborts the job. |
 
@@ -34,15 +34,15 @@ S3 Raw CSVs  ──from_catalog()──►  Glue PySpark ETL Job (G.1X × 2)
 
 ### Key AWS Services
 
-- **AWS Glue 4.0** — PySpark ETL job with Job Bookmarks (incremental processing)
-- **AWS Glue Data Catalog** — Static schema definitions, no Crawler
-- **Amazon DynamoDB** — Single-table design, KMS-encrypted
-- **Amazon S3** — Raw CSV bucket + Parquet output bucket, KMS-encrypted
-- **AWS Lambda** — Python 3.12 read API, invoked directly or via Function URL
-- **Amazon Athena** — Ad-hoc SQL over Parquet via `hr_analytics_wg` workgroup
-- **AWS KMS** — Customer-managed key with annual rotation; applied to all three S3 buckets and DynamoDB
-- **AWS SSM Parameter Store** — Runtime config discovery (Zero-Trust)
-- **Amazon CloudWatch** — Dashboard `hr-pipeline-observability`
+- **AWS Glue 4.0** - PySpark ETL job with Job Bookmarks (incremental processing)
+- **AWS Glue Data Catalog** - Static schema definitions, no Crawler
+- **Amazon DynamoDB** - Single-table design, KMS-encrypted
+- **Amazon S3** - Raw CSV bucket + Parquet output bucket, KMS-encrypted
+- **AWS Lambda** - Python 3.12 read API, invoked directly or via Function URL
+- **Amazon Athena** - Ad-hoc SQL over Parquet via `hr_analytics_wg` workgroup
+- **AWS KMS** - Customer-managed key with annual rotation; applied to all three S3 buckets and DynamoDB
+- **AWS SSM Parameter Store** - Runtime config discovery (Zero-Trust)
+- **Amazon CloudWatch** - Dashboard `hr-pipeline-observability`
 
 ---
 
@@ -63,7 +63,7 @@ S3 Raw CSVs  ──from_catalog()──►  Glue PySpark ETL Job (G.1X × 2)
 
 | Column | Catalog Type | Notes |
 |---|---|---|
-| `EmployeeID` | `int` | Primary key — must be non-null and unique |
+| `EmployeeID` | `int` | Primary key - must be non-null and unique |
 | `FirstName` | `string` | |
 | `LastName` | `string` | |
 | `Email` | `string` | |
@@ -99,7 +99,7 @@ S3 Raw CSVs  ──from_catalog()──►  Glue PySpark ETL Job (G.1X × 2)
 | `ManagerName` | `string` | |
 | `Department` | `string` | |
 | `ManagerEmail` | `string` | |
-| `IsActive` | `string` | Stored as literal `"True"` / `"False"` — never cast to boolean |
+| `IsActive` | `string` | Stored as literal `"True"` / `"False"` - never cast to boolean |
 | `Level` | `string` | e.g. `Director`, `VP` |
 
 ---
@@ -198,8 +198,8 @@ Applied in `src/glue/etl_job.py` before any joins or quality checks.
 | Join key normalisation | `DeptID`, `ManagerID` | Cast to `string` so join keys are type-consistent |
 | Salary normalisation | `Salary` | Cast to `double` |
 | Salary range normalisation | `MaxSalaryRange`, `MinSalaryRange` | Cast to `double` |
-| Null fill (string) | All `StringType` columns | `na.fill("")` — prevents DynamoDB `SerializationException` |
-| Null fill (double) | All `DoubleType` columns | `na.fill(0.0)` — prevents DynamoDB `SerializationException` |
+| Null fill (string) | All `StringType` columns | `na.fill("")` - prevents DynamoDB `SerializationException` |
+| Null fill (double) | All `DoubleType` columns | `na.fill(0.0)` - prevents DynamoDB `SerializationException` |
 
 ---
 
@@ -236,7 +236,7 @@ All runtime resource identifiers are fetched at Glue job startup via `boto3 ssm.
 | `/hr-pipeline/parquet-bucket-name` | S3 bucket name for Parquet output | `PARQUET_BASE` in `etl_job.py` |
 | `/hr-pipeline/dynamodb-table-name` | DynamoDB table name for the single-table design | `DYNAMO_TABLE` in `etl_job.py` |
 
-**IAM scope:** The Glue job role has `ssm:GetParameter` and `ssm:GetParameters` restricted to `arn:aws:ssm:us-east-1:<account>:parameter/hr-pipeline/*` — no broader SSM access.
+**IAM scope:** The Glue job role has `ssm:GetParameter` and `ssm:GetParameters` restricted to `arn:aws:ssm:us-east-1:<account>:parameter/hr-pipeline/*` - no broader SSM access.
 
 ---
 
@@ -246,28 +246,28 @@ All runtime resource identifiers are fetched at Glue job startup via `boto3 ssm.
 
 | Widget | Namespace | Metric | Dimension | Statistic | Period |
 |---|---|---|---|---|---|
-| Glue ETL — Succeeded Tasks | `Glue` | `glue.driver.aggregate.numSucceededTasks` | `JobName` | Sum | 5 min |
-| Glue ETL — Failed Tasks | `Glue` | `glue.driver.aggregate.numFailedTasks` | `JobName` | Sum | 5 min |
-| Athena — Bytes Scanned per Query | `AWS/Athena` | `DataScannedInBytes` | `WorkGroup: hr_analytics_wg` | Sum | 5 min |
+| Glue ETL - Succeeded Tasks | `Glue` | `glue.driver.aggregate.numSucceededTasks` | `JobName` | Sum | 5 min |
+| Glue ETL - Failed Tasks | `Glue` | `glue.driver.aggregate.numFailedTasks` | `JobName` | Sum | 5 min |
+| Athena - Bytes Scanned per Query | `AWS/Athena` | `DataScannedInBytes` | `WorkGroup: hr_analytics_wg` | Sum | 5 min |
 
 ### Glue Job Configuration
 
 | Setting | Value | Rationale |
 |---|---|---|
 | `WorkerType` | `G.1X` | Minimum valid type for batch ETL; 4 vCPU, 16 GB memory per worker |
-| `NumberOfWorkers` | `2` | 1 driver + 1 executor — sufficient for HR dataset scale |
+| `NumberOfWorkers` | `2` | 1 driver + 1 executor - sufficient for HR dataset scale |
 | `MaxRetries` | `0` | Fail fast; no silent retry masking data quality issues |
 | `Timeout` | `5 minutes` | Hard stop to prevent runaway DPU billing |
 | `MaxConcurrentRuns` | `1` | Prevents interleaved DynamoDB writes from parallel runs |
 | `GlueVersion` | `4.0` | Latest stable; required for `EvaluateDataQuality` native support |
-| Job Bookmarks | Enabled | `--job-bookmark-option: job-bookmark-enable` — incremental processing |
+| Job Bookmarks | Enabled | `--job-bookmark-option: job-bookmark-enable` - incremental processing |
 
 ### Athena Workgroup: `hr_analytics_wg`
 
 | Setting | Value |
 |---|---|
 | `BytesScannedCutoffPerQuery` | `104857600` (100 MB) |
-| `EnforceWorkGroupConfiguration` | `true` — client overrides not permitted |
+| `EnforceWorkGroupConfiguration` | `true` - client overrides not permitted |
 | `PublishCloudWatchMetricsEnabled` | `true` |
 | Result location | `s3://<assets-bucket>/athena-results/` |
 
@@ -309,7 +309,7 @@ No `Resource: "*"` exists in any custom IAM statement.
 { "employee_id": "1001" }
 ```
 
-### Response — 200 OK
+### Response - 200 OK
 
 ```json
 {

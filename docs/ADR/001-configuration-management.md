@@ -1,4 +1,4 @@
-# ADR 001 — Configuration Management: SSM Parameter Store over Environment Variables
+# ADR 001 - Configuration Management: SSM Parameter Store over Environment Variables
 
 | Field | Value |
 |---|---|
@@ -19,7 +19,7 @@ During Phase 4 of the HR Analytics ETL pipeline, the Glue job and Lambda handler
 
 The initial Phase 2/3 implementation injected these values as environment variables at CDK synth time (`environment={"DYNAMO_TABLE": table.table_name}`). While convenient during early development, this approach had three structural problems:
 
-1. **Infrastructure lifecycle coupling.** The table name was baked into the Lambda deployment package configuration at `cdk deploy` time. Any rename or re-create of the DynamoDB table required a Lambda redeployment — not because the _code_ changed, but because the _name_ changed.
+1. **Infrastructure lifecycle coupling.** The table name was baked into the Lambda deployment package configuration at `cdk deploy` time. Any rename or re-create of the DynamoDB table required a Lambda redeployment - not because the _code_ changed, but because the _name_ changed.
 
 2. **Zero-Trust violation.** Environment variables are visible in the AWS Lambda console, the CloudFormation template, and any snapshot of the deployment artefact. This violates the principle that secrets and operational config should be fetched at runtime from a controlled store with auditable access.
 
@@ -61,7 +61,7 @@ No broader SSM access is granted to either principal.
 
 ### Positive
 
-- **Decoupled lifecycles.** Changing the DynamoDB table name (e.g., blue/green swap) requires only an SSM `put-parameter` — no Lambda or Glue redeployment.
+- **Decoupled lifecycles.** Changing the DynamoDB table name (e.g., blue/green swap) requires only an SSM `put-parameter` - no Lambda or Glue redeployment.
 - **Auditable access.** Every SSM `GetParameter` call is logged in AWS CloudTrail, giving a full audit trail of which principal read which config value and when.
 - **Zero-Trust compliant.** No resource names appear in source code, environment variables, or deployment artefacts.
 - **Single source of truth.** The CDK stack writes the parameters; callers read them. There is no other authoritative location.
@@ -69,7 +69,7 @@ No broader SSM access is granted to either principal.
 ### Negative / Trade-offs
 
 - **Slightly higher cold-start latency.** The Lambda handler makes one SSM API call per cold start (~15–40 ms on a warm VPC-less Lambda). This is negligible for the HR query workload (no SLA < 1 s).
-- **Additional IAM surface.** Each principal needs an explicit `ssm:GetParameter` grant. This is a deliberate, reviewable permission — not a drawback.
+- **Additional IAM surface.** Each principal needs an explicit `ssm:GetParameter` grant. This is a deliberate, reviewable permission - not a drawback.
 - **SSM availability dependency.** If the SSM regional endpoint is unavailable, the Lambda cold start and Glue job start will fail. In practice, SSM SLA (99.9%) is higher than the pipeline's own SLA.
 
 ---
@@ -88,5 +88,5 @@ No broader SSM access is granted to either principal.
 ## References
 
 - [AWS SSM Parameter Store pricing](https://aws.amazon.com/systems-manager/pricing/)
-- [AWS Well-Architected: Security Pillar — Secrets Management](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/protecting-secrets.html)
+- [AWS Well-Architected: Security Pillar - Secrets Management](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/protecting-secrets.html)
 - QA Audit finding: Zero-Trust Violation in `infrastructure_stack.py` (remediated in commit `703542d`)
