@@ -174,6 +174,19 @@ class InfrastructureStack(Stack):
                         f"{raw_bucket.bucket_arn}/raw/*",
                     ],
                 ),
+                # ListBucket is a bucket-level action (not object-level) so it must
+                # target the bucket ARN.  The StringLike condition narrows scope to
+                # the employees/ prefix — the Glue job cannot list any other prefix.
+                # Required by _purge_parquet_partitions() in etl_job.py: the function
+                # calls list_objects_v2 before delete_objects to discover stale files.
+                iam.PolicyStatement(
+                    sid="S3ParquetListForPurge",
+                    actions=["s3:ListBucket"],
+                    resources=[parquet_bucket.bucket_arn],
+                    conditions={
+                        "StringLike": {"s3:prefix": ["employees/*"]}
+                    },
+                ),
                 # employees* covers both data files and the Hadoop folder marker object
                 iam.PolicyStatement(
                     sid="S3ParquetWrite",

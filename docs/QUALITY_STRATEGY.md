@@ -60,7 +60,14 @@ Step 7: DynamoDB sink (operational)
   │  Encrypted at rest: CUSTOMER_MANAGED KMS CMK
   │
   ▼
-Step 8: Parquet sink (analytical)
+Step 8a: Partition-level purge (dynamic overwrite)  ◄── STALE-DATA GUARD
+  │  Before writing, list and delete all existing files in the partitions
+  │  this run will touch. Only affected partitions are cleared — historical
+  │  partitions outside this batch are left intact.
+  │  (Implements dynamic partition overwrite without leaving getSink.)
+  │
+  ▼
+Step 8b: Parquet sink (analytical)
      s3://<PARQUET-BUCKET>/employees/year=.../month=.../dept=.../
      LastName: SHA-256 hash (pseudonymisation — analytics needs patterns, not identities)
      Salary: visible (primary analytical metric; access controlled by IAM)
@@ -148,18 +155,21 @@ Key rotation is enabled (`enable_key_rotation=True`). AWS KMS CloudTrail logs ev
 
 ### 3.3 IAM Scope (Least-Privilege)
 
-The Glue role (`GlueDataAccessPolicy`) has eight scoped statements — no wildcard resources:
+The Glue role (`GlueDataAccessPolicy`) has nine scoped statements — no wildcard resources:
 
 | Statement | Scope |
 |---|---|
 | `S3RawRead` | `GetObject`, `ListBucket` on raw prefix only |
-| `S3ParquetWrite` | `PutObject`, `DeleteObject` on `employees*` prefix only |
+| `S3ParquetListForPurge` | `ListBucket` on parquet bucket with `employees/*` prefix condition only |
+| `S3ParquetWrite` | `PutObject`, `DeleteObject` on `employees*` objects only |
 | `S3AssetsTempDir` | Full CRUD on assets bucket (shuffle spill + bookmarks) |
 | `S3QuarantineWrite` | `PutObject` on `quarantine/*` only — **cannot read or delete** |
 | `DynamoDBScopedWrite` | `DescribeTable`, `PutItem`, `BatchWriteItem` on one table |
 | `KmsEncryptDecrypt` | `GenerateDataKey*`, `Decrypt` on one key |
 | `SsmReadConfig` | `GetParameter` on `/hr-pipeline/*` only |
 | `GlueCatalogPartitions` | `GetTable`, `BatchCreatePartition`, `UpdateTable` on two resources |
+
+`S3ParquetListForPurge` and `S3ParquetWrite` are intentionally split into two statements because `s3:ListBucket` is a bucket-level action that must target the bucket ARN, while object actions target the `employees*` key prefix. Combining them into one statement would require the bucket ARN as a resource, which would silently grant list access to all prefixes.
 
 The Lambda role gets `grant_read_data()` on DynamoDB plus `kms:Decrypt` on the CMK. Without the explicit `kms:Decrypt` grant, every `GetItem` call against a CUSTOMER_MANAGED-encrypted table returns `KMSAccessDeniedException`.
 
@@ -174,11 +184,74 @@ Both alarms route to `hr-pipeline-alerts` SNS topic. Subscribe an email address 
 
 ---
 
-## 4. Recovery Point Objective (RPO)
+## 4. Stale Data and the Partition Overwrite Problem
+
+> This section documents a compliance incident discovered during live pipeline validation and the automated fix that prevents recurrence.
+
+### 4.1 Root Cause
+
+Glue's `getSink()` API **appends** new Parquet files to existing S3 partition prefixes. It does not overwrite or replace existing files. When a transformation changes between pipeline runs, Athena scans all files in the partition — old and new — producing mixed output.
+
+**Concrete impact observed**: The `lastname` column was SHA-256 hashed starting from run N. Runs N-1 and earlier had written plain-text last names to the same S3 partitions. Athena returned both values in a single query result: a direct GDPR violation (pseudonymised and non-pseudonymised PII co-existing in the analytical sink).
+
+### 4.2 Why This Is a Compliance Violation
+
+The Differential Privacy model implemented here relies on a hard boundary:
+
+| Sink | `lastname` value |
+|---|---|
+| DynamoDB (operational) | Plain-text — HR API requires it |
+| S3 Parquet (analytical) | SHA-256 hash only — data scientists must never see real names |
+
+If old plain-text files survive in the Parquet prefix, that boundary collapses. Any Athena query over a multi-run partition would expose real last names regardless of the current job's masking logic.
+
+### 4.3 The Fix: Dynamic Partition Overwrite
+
+`_purge_parquet_partitions()` in `etl_job.py` runs as Step 8a, immediately before `getSink`:
+
+1. Collects the distinct `(year, month, dept)` partitions the current run will write.
+2. For each partition, lists all existing S3 objects and deletes them via `delete_objects`.
+3. `getSink` then writes fresh files to a clean prefix — no stale file can survive.
+
+Only partitions touched by the current run are cleared. Historical partitions from batches outside this run are preserved.
+
+```
+Before getSink (Step 8a):
+  s3://<PARQUET-BUCKET>/employees/year=2019/month=7/dept=500/
+    plain-text-run.snappy.parquet   ← DELETED by _purge_parquet_partitions()
+    another-old-run.snappy.parquet  ← DELETED
+
+After getSink (Step 8b):
+  s3://<PARQUET-BUCKET>/employees/year=2019/month=7/dept=500/
+    run-parquet_sink-12-part-block-0-0-r-00001.snappy.parquet  ← hashed only
+```
+
+### 4.4 Why Not `df.write.mode("overwrite")`?
+
+The Spark DataFrame API `df.write.mode("overwrite").parquet(path)` with `spark.sql.sources.partitionOverwriteMode=dynamic` achieves the same partition-level overwrite. However, it bypasses `getSink`, which means:
+
+- Glue does not call `glue:BatchCreatePartition` after the write.
+- New partitions do not appear in the Glue Data Catalog automatically.
+- Athena queries against the catalog table return no results for new partitions until `MSCK REPAIR TABLE` is run manually.
+
+The boto3 purge-then-getSink approach retains automatic catalog registration while achieving overwrite semantics — it is strictly superior for this architecture.
+
+### 4.5 Prevention Checklist for Future Engineers
+
+If you change any column transformation in the Parquet sink path:
+
+- [ ] Confirm `_purge_parquet_partitions()` is still the step immediately before `getSink`.
+- [ ] After deploying the new job, run `python src/reconciliation/reconcile.py` to verify counts.
+- [ ] Query Athena: `SELECT DISTINCT LENGTH(lastname) FROM hr_analytics.employees LIMIT 10` — all values must be 64 (SHA-256) or NULL. Any value outside this range means stale plain-text data survived.
+- [ ] If stale files are found despite the purge: check IAM `S3ParquetListForPurge` is attached to the Glue role and that the prefix condition matches `employees/*`.
+
+---
+
+## 5. Recovery Point Objective (RPO)
 
 **Target RPO**: Zero data loss for records that passed DQ validation. Quarantined rows are preserved indefinitely in S3.
 
-### 4.1 Job Bookmark (Incremental Replay)
+### 5.1 Job Bookmark (Incremental Replay)
 
 The ETL job runs with `--job-bookmark-option=job-bookmark-enable`. Glue records the S3 object version and byte offset of each successfully processed file. On re-run:
 
@@ -193,11 +266,11 @@ aws glue reset-job-bookmark --job-name <GLUE_JOB_NAME>
 
 Then re-trigger the job. All source CSVs are re-processed from the beginning.
 
-### 4.2 S3 as Source of Truth
+### 5.2 S3 as Source of Truth
 
 Raw CSVs in `s3://<RAW-BUCKET>/raw/employees/` are the authoritative source. Because the ETL only reads from S3 (never modifies it), the pipeline is **idempotent**: re-running against the same S3 data produces the same DynamoDB and Parquet output. DynamoDB `PutItem` overwrites existing items with identical data.
 
-### 4.3 Replay Steps
+### 5.3 Replay Steps
 
 If a pipeline run fails after partial writes:
 
@@ -207,7 +280,7 @@ If a pipeline run fails after partial writes:
 4. Re-trigger the job via the Glue console or `aws glue start-job-run`.
 5. After completion, run `python src/reconciliation/reconcile.py` to verify counts converge.
 
-### 4.4 Quarantine Remediation
+### 5.4 Quarantine Remediation
 
 Quarantined rows are not permanently lost — they are stored in S3 for manual remediation:
 

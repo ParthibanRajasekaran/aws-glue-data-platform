@@ -347,6 +347,68 @@ parquet_df = (
     .withColumn("lastname", F.sha2(F.col("lastname").cast("string"), 256))
 )
 
+# ── Step 8a: Partition-level purge (dynamic overwrite) ────────────────────────
+# Glue's getSink APPENDS new Parquet files alongside existing ones in a
+# partition.  This is correct for incremental delta loads but creates a
+# Compliance Violation when a transformation changes (e.g. plain-text LastName
+# in run N co-existing with SHA-256 hashed LastName in run N+1) — Athena will
+# scan ALL files and return a mix of old and new values.
+#
+# Fix: before getSink writes, delete every existing file in the partitions this
+# run will touch.  Only affected partitions are purged — historical partitions
+# not in the current batch are left intact (safe for job-bookmark delta loads).
+#
+# This implements the "dynamic partition overwrite" pattern: the semantics of
+# df.write.mode("overwrite").option("partitionOverwriteMode","dynamic")
+# but applied at the boto3 layer so getSink's catalog-update capability is kept.
+
+
+def _purge_parquet_partitions(df, bucket_name: str, base_prefix: str) -> None:
+    """Delete stale S3 objects from partitions this run will write.
+
+    Args:
+        df: Parquet DataFrame — must already have year, month, dept columns.
+        bucket_name: Parquet S3 bucket name (no s3:// prefix).
+        base_prefix: Key prefix for the table without trailing slash (e.g. "employees").
+
+    IAM required: s3:ListBucket on the bucket (employees/* prefix condition)
+                  s3:DeleteObject on employees* objects.
+    """
+    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    partitions = df.select("year", "month", "dept").distinct().collect()
+    deleted_total = 0
+
+    for row in partitions:
+        prefix = (
+            f"{base_prefix}/year={row['year']}"
+            f"/month={row['month']}"
+            f"/dept={row['dept']}/"
+        )
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+            if keys:
+                s3_client.delete_objects(
+                    Bucket=bucket_name,
+                    Delete={"Objects": keys},
+                )
+                deleted_total += len(keys)
+
+    if deleted_total:
+        logger.info(
+            f"[PartitionPurge] Deleted {deleted_total} stale file(s) across "
+            f"{len(partitions)} partition(s) in s3://{bucket_name}/{base_prefix}/. "
+            "Fresh write begins — no stale data can survive."
+        )
+    else:
+        logger.info(
+            f"[PartitionPurge] No existing files found in affected partitions — "
+            f"first write to s3://{bucket_name}/{base_prefix}/."
+        )
+
+
+_purge_parquet_partitions(parquet_df, _ssm["parquet-bucket-name"], "employees")
+
 parquet_sink = glueContext.getSink(
     path=f"{PARQUET_BASE}/employees/",
     connection_type="s3",
