@@ -160,16 +160,16 @@ The Glue role (`GlueDataAccessPolicy`) has nine scoped statements — no wildcar
 | Statement | Scope |
 |---|---|
 | `S3RawRead` | `GetObject`, `ListBucket` on raw prefix only |
-| `S3ParquetListForPurge` | `ListBucket` on parquet bucket with `employees/*` prefix condition only |
-| `S3ParquetWrite` | `PutObject`, `DeleteObject` on `employees*` objects only |
+| `S3ParquetListForAtomicWrite` | `ListBucket` on parquet bucket with `employees/*` and `employees_staging/*` conditions only |
+| `S3ParquetWrite` | `PutObject`, `GetObject`, `DeleteObject` on `employees*` objects (covers staging prefix too) |
 | `S3AssetsTempDir` | Full CRUD on assets bucket (shuffle spill + bookmarks) |
 | `S3QuarantineWrite` | `PutObject` on `quarantine/*` only — **cannot read or delete** |
 | `DynamoDBScopedWrite` | `DescribeTable`, `PutItem`, `BatchWriteItem` on one table |
 | `KmsEncryptDecrypt` | `GenerateDataKey*`, `Decrypt` on one key |
 | `SsmReadConfig` | `GetParameter` on `/hr-pipeline/*` only |
-| `GlueCatalogPartitions` | `GetTable`, `BatchCreatePartition`, `UpdateTable` on two resources |
+| `GlueCatalogPartitions` | `GetTable`, `BatchCreatePartition`, `UpdatePartition`, `UpdateTable` on two resources |
 
-`S3ParquetListForPurge` and `S3ParquetWrite` are intentionally split into two statements because `s3:ListBucket` is a bucket-level action that must target the bucket ARN, while object actions target the `employees*` key prefix. Combining them into one statement would require the bucket ARN as a resource, which would silently grant list access to all prefixes.
+`S3ParquetListForAtomicWrite` and `S3ParquetWrite` are intentionally split into two statements because `s3:ListBucket` is a bucket-level action that must target the bucket ARN, while object actions target the `employees*` key prefix. Combining them into one statement would require the bucket ARN as a resource, which would silently grant list access to all prefixes.
 
 The Lambda role gets `grant_read_data()` on DynamoDB plus `kms:Decrypt` on the CMK. Without the explicit `kms:Decrypt` grant, every `GetItem` call against a CUSTOMER_MANAGED-encrypted table returns `KMSAccessDeniedException`.
 
@@ -184,9 +184,9 @@ Both alarms route to `hr-pipeline-alerts` SNS topic. Subscribe an email address 
 
 ---
 
-## 4. Stale Data and the Partition Overwrite Problem
+## 4. Stale Data and the Atomic Partition Write Pattern
 
-> This section documents a compliance incident discovered during live pipeline validation and the automated fix that prevents recurrence.
+> This section documents a compliance incident discovered during live pipeline validation and the two-phase atomic fix that prevents recurrence.
 
 ### 4.1 Root Cause
 
@@ -203,27 +203,44 @@ The Differential Privacy model implemented here relies on a hard boundary:
 | DynamoDB (operational) | Plain-text — HR API requires it |
 | S3 Parquet (analytical) | SHA-256 hash only — data scientists must never see real names |
 
-If old plain-text files survive in the Parquet prefix, that boundary collapses. Any Athena query over a multi-run partition would expose real last names regardless of the current job's masking logic.
+If old plain-text files survive in the Parquet prefix, that boundary collapses. Any Athena query over a multi-run partition exposes real last names regardless of the current job's masking logic.
 
-### 4.3 The Fix: Dynamic Partition Overwrite
+### 4.3 The Fix: Two-Phase Atomic Write (Stage → Verify → Swap)
 
-`_purge_parquet_partitions()` in `etl_job.py` runs as Step 8a, immediately before `getSink`:
+The first fix — purge-then-getSink — had a residual 1% risk: if `getSink` failed midway, the production partition was left **empty** (data loss). The empty partition looked identical to a missing partition to Athena — silent failure.
 
-1. Collects the distinct `(year, month, dept)` partitions the current run will write.
-2. For each partition, lists all existing S3 objects and deletes them via `delete_objects`.
-3. `getSink` then writes fresh files to a clean prefix — no stale file can survive.
-
-Only partitions touched by the current run are cleared. Historical partitions from batches outside this run are preserved.
+`_atomic_parquet_write()` in `etl_job.py` implements a two-phase commit:
 
 ```
-Before getSink (Step 8a):
-  s3://<PARQUET-BUCKET>/employees/year=2019/month=7/dept=500/
-    plain-text-run.snappy.parquet   ← DELETED by _purge_parquet_partitions()
-    another-old-run.snappy.parquet  ← DELETED
+Phase 1 — Stage:   Spark writes to employees_staging/
+                   Production is completely untouched.
+                   If this fails → RuntimeError, nothing lost, safe to replay.
 
-After getSink (Step 8b):
-  s3://<PARQUET-BUCKET>/employees/year=2019/month=7/dept=500/
-    run-parquet_sink-12-part-block-0-0-r-00001.snappy.parquet  ← hashed only
+Phase 2 — Verify:  Assert staging/ contains ≥ 1 Parquet file.
+                   If empty → RuntimeError before touching production.
+
+Phase 3 — Swap:    Purge only affected production partition prefixes.
+                   Server-side copy staging → production (no egress cost).
+                   Purge staging prefix (including Spark's _SUCCESS marker).
+
+Phase 4 — Catalog: BatchCreatePartition for new partitions.
+                   UpdatePartition for partitions that already exist.
+                   Athena sees fresh data instantly — no MSCK REPAIR TABLE.
+```
+
+**Visualised:**
+```
+employees_staging/year=2019/month=7/dept=500/
+  part-00000-...snappy.parquet   ← Phase 1 writes here
+
+  Phase 2: verified non-empty ✓
+
+  Phase 3a: employees/year=2019/month=7/dept=500/ → purged
+  Phase 3b: staging files → server-side copied to employees/
+  Phase 3c: staging prefix → purged
+
+employees/year=2019/month=7/dept=500/
+  part-00000-...snappy.parquet   ← only SHA-256 hashed lastname survives
 ```
 
 ### 4.4 Why Not `df.write.mode("overwrite")`?
@@ -234,16 +251,35 @@ The Spark DataFrame API `df.write.mode("overwrite").parquet(path)` with `spark.s
 - New partitions do not appear in the Glue Data Catalog automatically.
 - Athena queries against the catalog table return no results for new partitions until `MSCK REPAIR TABLE` is run manually.
 
-The boto3 purge-then-getSink approach retains automatic catalog registration while achieving overwrite semantics — it is strictly superior for this architecture.
+`_atomic_parquet_write()` achieves overwrite semantics **and** keeps full catalog continuity via explicit `BatchCreatePartition` / `UpdatePartition` — strictly superior for this architecture.
 
-### 4.5 Prevention Checklist for Future Engineers
+### 4.5 Remaining Risk and Mitigations
+
+The 1% risk that remains: if Phase 3 copy fails mid-partition, that specific partition is empty until the next successful run.
+
+| Risk | Mitigation |
+|---|---|
+| Phase 3 copy failure | Reconciliation alarm catches empty/missing rows within the next run |
+| Partial staging write | Phase 2 verify catches it before production is touched |
+| Staging left orphaned | Phase 3c cleanup runs in the same execution; stale staging is overwritten by the next run's Phase 1 (`mode("overwrite")`) |
+| Catalog out of sync | Phase 4 runs after every successful swap; `UpdatePartition` handles re-runs |
+
+### 4.6 IAM for the Atomic Pattern
+
+The split between `S3ParquetListForAtomicWrite` and `S3ParquetWrite` is deliberate:
+
+- `s3:ListBucket` is a **bucket-level** action requiring the bucket ARN as resource. Combining it with object actions in one statement forces the bucket ARN into the object statement, silently granting listing on all prefixes.
+- Separating them with a `StringLike` prefix condition (`employees/*` and `employees_staging/*`) ensures the Glue role cannot list `athena-results/` or any other prefix in the same bucket — lateral movement is blocked.
+
+### 4.7 Prevention Checklist for Future Engineers
 
 If you change any column transformation in the Parquet sink path:
 
-- [ ] Confirm `_purge_parquet_partitions()` is still the step immediately before `getSink`.
+- [ ] Confirm `_atomic_parquet_write()` is called immediately after `parquet_df` is computed.
 - [ ] After deploying the new job, run `python src/reconciliation/reconcile.py` to verify counts.
-- [ ] Query Athena: `SELECT DISTINCT LENGTH(lastname) FROM hr_analytics.employees LIMIT 10` — all values must be 64 (SHA-256) or NULL. Any value outside this range means stale plain-text data survived.
-- [ ] If stale files are found despite the purge: check IAM `S3ParquetListForPurge` is attached to the Glue role and that the prefix condition matches `employees/*`.
+- [ ] Query Athena: `SELECT MIN(LENGTH(lastname)), MAX(LENGTH(lastname)) FROM hr_analytics.employees` — both values must be 64. Any deviation means a stale plain-text file survived the swap.
+- [ ] If stale files are found: check IAM `S3ParquetListForAtomicWrite` is attached and its prefix conditions include `employees/*` and `employees_staging/*`.
+- [ ] If staging prefix contains files after a job run: the job failed during Phase 3 — the next run's Phase 1 overwrites staging cleanly; run reconciliation to verify production counts.
 
 ---
 

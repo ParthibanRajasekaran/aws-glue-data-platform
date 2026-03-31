@@ -347,82 +347,220 @@ parquet_df = (
     .withColumn("lastname", F.sha2(F.col("lastname").cast("string"), 256))
 )
 
-# ── Step 8a: Partition-level purge (dynamic overwrite) ────────────────────────
-# Glue's getSink APPENDS new Parquet files alongside existing ones in a
-# partition.  This is correct for incremental delta loads but creates a
-# Compliance Violation when a transformation changes (e.g. plain-text LastName
-# in run N co-existing with SHA-256 hashed LastName in run N+1) — Athena will
-# scan ALL files and return a mix of old and new values.
+# ── Step 8a: Atomic Parquet write — staging + swap ───────────────────────────
+# The previous "purge-then-getSink" approach had a compliance risk window:
+# if getSink failed midway, the production partition was left empty (data loss).
+# A new file could not be distinguished from a missing file by Athena.
 #
-# Fix: before getSink writes, delete every existing file in the partitions this
-# run will touch.  Only affected partitions are purged — historical partitions
-# not in the current batch are left intact (safe for job-bookmark delta loads).
+# Two-phase atomic pattern:
+#   Phase 1 — Stage  : Spark writes to employees_staging/ (prod untouched).
+#                      If this fails, raise RuntimeError — nothing is lost.
+#   Phase 2 — Verify : Assert staging is non-empty before touching prod at all.
+#   Phase 3 — Swap   : Purge only the affected prod partitions; copy staging
+#                      files server-side (no data egress cost); purge staging.
+#   Phase 4 — Catalog: Register/update partition metadata in Glue Data Catalog
+#                      so Athena sees fresh partitions instantly without
+#                      MSCK REPAIR TABLE.
 #
-# This implements the "dynamic partition overwrite" pattern: the semantics of
-# df.write.mode("overwrite").option("partitionOverwriteMode","dynamic")
-# but applied at the boto3 layer so getSink's catalog-update capability is kept.
+# Remaining 1% risk: if Phase 3 copy fails mid-partition, that partition is
+# temporarily empty.  The reconciliation alarm catches this on the next run,
+# and the raw S3 source is always available for a full bookmark-reset replay.
+#
+# Why not df.write.mode("overwrite")?  It bypasses getSink and severs Glue
+# Catalog integration — partitions become invisible to Athena without a manual
+# MSCK REPAIR TABLE.  This function achieves overwrite semantics while keeping
+# full catalog continuity via explicit BatchCreatePartition / UpdatePartition.
 
 
-def _purge_parquet_partitions(df, bucket_name: str, base_prefix: str) -> None:
-    """Delete stale S3 objects from partitions this run will write.
+def _atomic_parquet_write(
+    parquet_df,
+    bucket_name: str,
+    prod_prefix: str,
+    staging_prefix: str,
+    glue_database: str,
+    glue_table: str,
+    region: str,
+) -> None:
+    """Write Parquet files to S3 atomically: stage → verify → swap → catalog.
 
     Args:
-        df: Parquet DataFrame — must already have year, month, dept columns.
-        bucket_name: Parquet S3 bucket name (no s3:// prefix).
-        base_prefix: Key prefix for the table without trailing slash (e.g. "employees").
+        parquet_df    : DataFrame with year, month, dept partition columns.
+        bucket_name   : Parquet S3 bucket name (no s3:// prefix).
+        prod_prefix   : Production key prefix, no trailing slash ("employees").
+        staging_prefix: Staging key prefix, no trailing slash ("employees_staging").
+        glue_database : Glue Data Catalog database name.
+        glue_table    : Glue Data Catalog table name.
+        region        : AWS region for boto3 clients.
 
-    IAM required: s3:ListBucket on the bucket (employees/* prefix condition)
-                  s3:DeleteObject on employees* objects.
+    IAM required:
+        s3:PutObject, s3:GetObject, s3:DeleteObject on employees* objects
+        s3:ListBucket with employees/* and employees_staging/* prefix conditions
+        glue:BatchCreatePartition, glue:UpdatePartition on the target table
     """
-    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
-    partitions = df.select("year", "month", "dept").distinct().collect()
-    deleted_total = 0
+    s3 = boto3.client("s3", region_name=region)
+    glue_client = boto3.client("glue", region_name=region)
+    paginator = s3.get_paginator("list_objects_v2")
 
-    for row in partitions:
-        prefix = (
-            f"{base_prefix}/year={row['year']}"
-            f"/month={row['month']}"
-            f"/dept={row['dept']}/"
+    staging_path = f"s3://{bucket_name}/{staging_prefix}/"
+
+    # ── Phase 1: Write to staging (production is untouched if this fails) ────
+    logger.info(f"[AtomicWrite] Phase 1 — Staging write to {staging_path}")
+    (
+        parquet_df.write
+        .mode("overwrite")
+        .option("compression", "snappy")
+        .partitionBy("year", "month", "dept")
+        .parquet(staging_path)
+    )
+
+    # ── Phase 2: Verify staging is non-empty before touching production ───────
+    logger.info("[AtomicWrite] Phase 2 — Verifying staging output")
+    staging_parquet_keys = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=f"{staging_prefix}/"):
+        staging_parquet_keys.extend(
+            obj["Key"] for obj in page.get("Contents", [])
+            if obj["Key"].endswith(".parquet")
         )
-        paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-            keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-            if keys:
-                s3_client.delete_objects(
-                    Bucket=bucket_name,
-                    Delete={"Objects": keys},
+    if not staging_parquet_keys:
+        raise RuntimeError(
+            "[AtomicWrite] Phase 2 FAILED: staging produced no Parquet files. "
+            "Production is untouched — reset the job bookmark and replay."
+        )
+    logger.info(
+        f"[AtomicWrite] Phase 2 — Verified: {len(staging_parquet_keys)} "
+        "staging file(s) ready."
+    )
+
+    # ── Phase 3: Swap — purge prod partitions; server-side copy staging → prod ─
+    logger.info("[AtomicWrite] Phase 3 — Swapping staging to production")
+    affected_partitions = parquet_df.select("year", "month", "dept").distinct().collect()
+
+    # 3a: Purge affected production partition prefixes.
+    # Optimisation: one paginated list over the entire prod_prefix instead of
+    # N separate list_objects_v2 calls (one per partition).  The affected set
+    # lookup is O(1) per key — far faster than 542 individual ListBucket calls.
+    affected_set = {
+        (str(row["year"]), str(row["month"]), str(row["dept"]))
+        for row in affected_partitions
+    }
+
+    def _partition_tuple_from_key(key):
+        """Extract (year, month, dept) from 'employees/year=X/month=Y/dept=Z/file'."""
+        parts = key.split("/")
+        # Expected: [prod_prefix, "year=X", "month=Y", "dept=Z", "filename"]
+        if len(parts) < 5:
+            return None
+        try:
+            year  = parts[1].split("=")[1]
+            month = parts[2].split("=")[1]
+            dept  = parts[3].split("=")[1]
+            return (year, month, dept)
+        except IndexError:
+            return None
+
+    keys_to_delete = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=f"{prod_prefix}/"):
+        for obj in page.get("Contents", []):
+            if _partition_tuple_from_key(obj["Key"]) in affected_set:
+                keys_to_delete.append({"Key": obj["Key"]})
+
+    purge_count = 0
+    for i in range(0, len(keys_to_delete), 1000):
+        s3.delete_objects(
+            Bucket=bucket_name,
+            Delete={"Objects": keys_to_delete[i:i + 1000]},
+        )
+        purge_count += min(1000, len(keys_to_delete) - i)
+
+    # 3b: Server-side copy staging Parquet files to production (no egress cost)
+    for staging_key in staging_parquet_keys:
+        prod_key = prod_prefix + staging_key[len(staging_prefix):]
+        s3.copy_object(
+            Bucket=bucket_name,
+            CopySource={"Bucket": bucket_name, "Key": staging_key},
+            Key=prod_key,
+        )
+
+    logger.info(
+        f"[AtomicWrite] Phase 3 — Purged {purge_count} stale file(s); "
+        f"copied {len(staging_parquet_keys)} fresh file(s) to production."
+    )
+
+    # 3c: Purge all staging objects (including Spark's _SUCCESS marker)
+    all_staging_keys = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=f"{staging_prefix}/"):
+        all_staging_keys.extend(
+            {"Key": obj["Key"]} for obj in page.get("Contents", [])
+        )
+    for i in range(0, len(all_staging_keys), 1000):  # delete_objects max 1000
+        s3.delete_objects(
+            Bucket=bucket_name,
+            Delete={"Objects": all_staging_keys[i:i + 1000]},
+        )
+
+    # ── Phase 4: Register / update partitions in Glue Data Catalog ───────────
+    # BatchCreatePartition returns per-partition errors for existing ones rather
+    # than raising; check the Errors list and call UpdatePartition for each.
+    logger.info("[AtomicWrite] Phase 4 — Updating Glue Data Catalog")
+    partition_inputs = [
+        {
+            "Values": [str(row["year"]), str(row["month"]), str(row["dept"])],
+            "StorageDescriptor": {
+                "Location": (
+                    f"s3://{bucket_name}/{prod_prefix}"
+                    f"/year={row['year']}/month={row['month']}/dept={row['dept']}/"
+                ),
+                "InputFormat": (
+                    "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+                ),
+                "OutputFormat": (
+                    "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+                ),
+                "SerdeInfo": {
+                    "SerializationLibrary": (
+                        "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+                    ),
+                    "Parameters": {"serialization.format": "1"},
+                },
+                "Compressed": True,
+            },
+        }
+        for row in affected_partitions
+    ]
+
+    for i in range(0, len(partition_inputs), 100):  # BatchCreatePartition max 100
+        batch = partition_inputs[i:i + 100]
+        response = glue_client.batch_create_partition(
+            DatabaseName=glue_database,
+            TableName=glue_table,
+            PartitionInputList=batch,
+        )
+        for err in response.get("Errors", []):
+            if err.get("ErrorDetail", {}).get("ErrorCode") == "AlreadyExistsException":
+                values = err["PartitionValues"]
+                part_input = next(p for p in batch if p["Values"] == values)
+                glue_client.update_partition(
+                    DatabaseName=glue_database,
+                    TableName=glue_table,
+                    PartitionValueList=values,
+                    PartitionInput=part_input,
                 )
-                deleted_total += len(keys)
 
-    if deleted_total:
-        logger.info(
-            f"[PartitionPurge] Deleted {deleted_total} stale file(s) across "
-            f"{len(partitions)} partition(s) in s3://{bucket_name}/{base_prefix}/. "
-            "Fresh write begins — no stale data can survive."
-        )
-    else:
-        logger.info(
-            f"[PartitionPurge] No existing files found in affected partitions — "
-            f"first write to s3://{bucket_name}/{base_prefix}/."
-        )
+    logger.info(
+        f"[AtomicWrite] Complete — {len(affected_partitions)} partition(s) in "
+        f"s3://{bucket_name}/{prod_prefix}/ refreshed and registered in Glue Catalog."
+    )
 
 
-_purge_parquet_partitions(parquet_df, _ssm["parquet-bucket-name"], "employees")
-
-parquet_sink = glueContext.getSink(
-    path=f"{PARQUET_BASE}/employees/",
-    connection_type="s3",
-    updateBehavior="UPDATE_IN_DATABASE",
-    partitionKeys=["year", "month", "dept"],
-    enableUpdateCatalog=True,
-    transformation_ctx="parquet_sink",
+_atomic_parquet_write(
+    parquet_df=parquet_df,
+    bucket_name=_ssm["parquet-bucket-name"],
+    prod_prefix="employees",
+    staging_prefix="employees_staging",
+    glue_database="hr_analytics",
+    glue_table="employees",
+    region=os.environ.get("AWS_REGION", "us-east-1"),
 )
-parquet_sink.setCatalogInfo(
-    catalogDatabase="hr_analytics",
-    catalogTableName="employees",
-)
-parquet_sink.setFormat("glueparquet", useGlueParquetWriter=True)
-parquet_sink.writeFrame(DynamicFrame.fromDF(parquet_df, glueContext, "parquet_dyf"))
 
 # REQUIRED: without this Glue marks the job run as failed
 job.commit()

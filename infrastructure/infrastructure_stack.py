@@ -174,23 +174,27 @@ class InfrastructureStack(Stack):
                         f"{raw_bucket.bucket_arn}/raw/*",
                     ],
                 ),
-                # ListBucket is a bucket-level action (not object-level) so it must
-                # target the bucket ARN.  The StringLike condition narrows scope to
-                # the employees/ prefix — the Glue job cannot list any other prefix.
-                # Required by _purge_parquet_partitions() in etl_job.py: the function
-                # calls list_objects_v2 before delete_objects to discover stale files.
+                # ListBucket is a bucket-level action so it must target the bucket ARN.
+                # The StringLike condition limits listing to the two prefixes the
+                # atomic write function uses — employees/ (production) and
+                # employees_staging/ (staging).  The Glue job cannot list any other
+                # prefix in the same bucket (e.g. athena-results/).
                 iam.PolicyStatement(
-                    sid="S3ParquetListForPurge",
+                    sid="S3ParquetListForAtomicWrite",
                     actions=["s3:ListBucket"],
                     resources=[parquet_bucket.bucket_arn],
                     conditions={
-                        "StringLike": {"s3:prefix": ["employees/*"]}
+                        "StringLike": {
+                            "s3:prefix": ["employees/*", "employees_staging/*"]
+                        }
                     },
                 ),
-                # employees* covers both data files and the Hadoop folder marker object
+                # GetObject added: _atomic_parquet_write uses s3:copy_object with the
+                # staging prefix as source — copy_object requires GetObject on the
+                # source key.  employees* covers both employees/ and employees_staging/.
                 iam.PolicyStatement(
                     sid="S3ParquetWrite",
-                    actions=["s3:PutObject", "s3:DeleteObject"],
+                    actions=["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
                     resources=[f"{parquet_bucket.bucket_arn}/employees*"],
                 ),
                 # Full CRUD: Glue writes TempDir shuffle spill, bookmarks, and script temp here
@@ -238,9 +242,17 @@ class InfrastructureStack(Stack):
                 # glue:GetTable added: getSink reads the catalog schema before writing
                 # partitions to verify output schema matches registered column definitions.
                 # Without it, getSink raises AccessDeniedException before any write.
+                # UpdatePartition added: _atomic_parquet_write calls update_partition
+                # for any partition that already exists in the catalog (BatchCreate
+                # returns AlreadyExistsException per-partition for those).
                 iam.PolicyStatement(
                     sid="GlueCatalogPartitions",
-                    actions=["glue:GetTable", "glue:BatchCreatePartition", "glue:UpdateTable"],
+                    actions=[
+                        "glue:GetTable",
+                        "glue:BatchCreatePartition",
+                        "glue:UpdatePartition",
+                        "glue:UpdateTable",
+                    ],
                     resources=[
                         f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:catalog",
                         f"arn:aws:glue:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:database/hr_analytics",
@@ -264,7 +276,7 @@ class InfrastructureStack(Stack):
             worker_type=glue_alpha.WorkerType.G_1X,
             number_of_workers=2,
             max_retries=0,
-            timeout=Duration.minutes(5),
+            timeout=Duration.minutes(15),  # atomic write adds staging + 542 copy_objects
             default_arguments={
                 # Bucket/table config now fetched from SSM at runtime — not passed here
                 "--TempDir": f"s3://{assets_bucket.bucket_name}/temp/",
