@@ -126,7 +126,8 @@ def run() -> None:
     )
 
     # ── Step 16: Summary Report ───────────────────────────────────────────────
-    print(f"""
+    print(
+        f"""
 === Phase 1 Setup Complete ===
 
 S3 Bucket     : s3://{config.S3_BUCKET_NAME}
@@ -137,7 +138,8 @@ Catalog Table : {config.GLUE_DATABASE_NAME}.{config.GLUE_TABLE_NAME} ({col_count
 DynamoDB Table: {config.DYNAMODB_TABLE_NAME} (PAY_PER_REQUEST, ACTIVE)
 
 Ready for Phase 2: PySpark ETL job implementation.
-""")
+"""
+    )
 
 
 if __name__ == "__main__":

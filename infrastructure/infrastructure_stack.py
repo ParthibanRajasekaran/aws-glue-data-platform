@@ -4,11 +4,7 @@ import os
 
 import aws_cdk as cdk
 import aws_cdk.aws_glue_alpha as glue_alpha
-from aws_cdk import (
-    Duration,
-    RemovalPolicy,
-    Stack,
-)
+from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_athena as athena
 from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_cloudwatch_actions as cloudwatch_actions
