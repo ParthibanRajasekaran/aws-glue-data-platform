@@ -8,9 +8,16 @@ that the environment is safe before any data processing begins.
 
 ## Scope
 
-Phase 1 covers infrastructure provisioning only. No data transformation occurs.
-The output of a successful Phase 1 run is a fully configured, idle AWS environment
-ready to accept a Phase 2 PySpark ETL job.
+Phase 1 covers the **standalone `pipeline_runner.py` provisioning script** only.
+It provisions a self-contained learning/testing environment (`employee_db`,
+`Employees` table keyed by `EmployeeID`) that is separate from the CDK-deployed
+production stack.
+
+The CDK stack (`infrastructure/infrastructure_stack.py`) provisions its own
+resources independently: the `hr_analytics` Glue catalog, the
+`aws-glue-demo-single-table` DynamoDB table with `PK`/`SK` string keys, and
+SSM parameters for runtime config. Running Phase 1 does **not** configure the
+prerequisites for the CDK ETL/Lambda path.
 
 ---
 

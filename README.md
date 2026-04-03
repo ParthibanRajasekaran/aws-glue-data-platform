@@ -35,11 +35,11 @@ flowchart TD
         SSM["SSM Parameter Store\nAll resource names resolved at runtime\nNo hardcoded ARNs in source code"]
     end
 
-    subgraph Phase1["Phase 1 - Infrastructure Provisioning (pipeline_runner.py)"]
+    subgraph Phase1["Phase 1 - Standalone Provisioner (pipeline_runner.py only)"]
         S3RAW["S3 Raw Bucket\nSSE-S3 encryption · Versioning\nAll public access blocked"]
         IAM["IAM Role: AWSGlueRole-EmployeeETL\nAWSGlueServiceRole (managed)\nScoped inline: GetObject/PutObject/ListBucket"]
         CRAWLER["Glue Crawler: employee-csv-crawler\nTargets raw/employees/\nIdempotent - reconciles on re-run"]
-        DDB_TBL["DynamoDB: Employees\nPAY_PER_REQUEST billing\nPartition key: EmployeeID (Number)"]
+        DDB_TBL["DynamoDB: Employees (standalone schema)\nPAY_PER_REQUEST · PK: EmployeeID (Number)\nNot used by the CDK ETL path"]
     end
 
     subgraph Sources["Source Layer - S3 Raw Bucket (KMS CMK)"]
@@ -48,8 +48,8 @@ flowchart TD
         MGR_CSV["managers.csv\nraw/managers/"]
     end
 
-    subgraph Catalog["Glue Data Catalog - employee_db"]
-        EMP_TBL["employees table\nCrawler-discovered"]
+    subgraph Catalog["Glue Data Catalog - hr_analytics (CDK-deployed)"]
+        EMP_TBL["raw_employees\nCDK CfnTable - schema authority"]
         DEPT_TBL["raw_departments\nCDK CfnTable - schema authority"]
         MGR_TBL["raw_managers\nCDK CfnTable - schema authority"]
     end
@@ -67,12 +67,12 @@ flowchart TD
     subgraph Sinks["Dual Sink"]
         ATOMIC["_atomic_parquet_write()\nStage to _staging/ prefix\nVerify row count\nRename to final prefix (atomic swap)"]
         S3PQ["S3 Parquet Bucket (KMS CMK)\nyear= / month= / dept= partitions\nSNAPPY compressed\nAthena workgroup: 100 MB scan guardrail"]
-        DDB_WRITE["DynamoDB: Employees\n(KMS CMK)\nPAY_PER_REQUEST"]
+        DDB_WRITE["DynamoDB: aws-glue-demo-single-table\nPK (STRING) / SK (STRING)\nKMS CMK · PAY_PER_REQUEST"]
         QUAR["S3 Quarantine Bucket (KMS CMK)\nDQ-rejected rows only\nIsolated from clean data path"]
     end
 
     subgraph Consumer["API Consumer"]
-        LAMBDA["Lambda: GetEmployee\nGetItem by EmployeeID\nSSM-resolved table name"]
+        LAMBDA["Lambda: GetEmployee\nGetItem by PK=EMP#id SK=PROFILE\nSSM-resolved table name"]
         API["API Gateway\nREST endpoint"]
     end
 
@@ -84,7 +84,7 @@ flowchart TD
     SSM -->|"resource names"| ETL
     SSM -->|"resource names"| LAMBDA
 
-    EMP_CSV --> CRAWLER --> EMP_TBL
+    EMP_CSV --> EMP_TBL
     DEPT_CSV --> DEPT_TBL
     MGR_CSV --> MGR_TBL
 

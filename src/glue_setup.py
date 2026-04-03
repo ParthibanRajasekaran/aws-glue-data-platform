@@ -76,7 +76,7 @@ def create_crawler(config: Config, role_arn: str) -> None:
         logger.info("Created Glue crawler '%s' targeting %s", crawler_name, target_path)
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "AlreadyExistsException":
-            logger.info("Glue crawler already exists: %s — reconciling config", crawler_name)
+            logger.info("Glue crawler already exists: %s - reconciling config", crawler_name)
             existing = glue.get_crawler(Name=crawler_name)["Crawler"]
             if existing.get("Schedule"):
                 raise CrawlerConfigurationError(

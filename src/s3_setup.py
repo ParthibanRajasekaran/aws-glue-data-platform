@@ -43,8 +43,13 @@ def create_bucket(config: Config) -> str:
         logger.info("Created S3 bucket: %s", bucket)
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
-        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+        if code == "BucketAlreadyOwnedByYou":
             logger.info("S3 bucket already exists (owned by this account): %s", bucket)
+        elif code == "BucketAlreadyExists":
+            raise BucketCreationError(
+                f"Bucket name '{bucket}' is already taken by another AWS account. "
+                "Choose a different globally unique bucket name."
+            ) from exc
         else:
             raise BucketCreationError(f"Failed to create bucket '{bucket}': {exc}") from exc
 

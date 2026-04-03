@@ -137,7 +137,10 @@ Glue Database : {config.GLUE_DATABASE_NAME}
 Catalog Table : {config.GLUE_DATABASE_NAME}.{config.GLUE_TABLE_NAME} ({col_count} columns)
 DynamoDB Table: {config.DYNAMODB_TABLE_NAME} (PAY_PER_REQUEST, ACTIVE)
 
-Ready for Phase 2: PySpark ETL job implementation.
+Phase 1 standalone provisioning is complete.
+Note: the CDK-deployed Glue ETL path uses separate resources (hr_analytics
+catalog, aws-glue-demo-single-table with PK/SK keys, SSM-based config).
+See infrastructure/infrastructure_stack.py and deploy.sh for that path.
 """
     )
 
