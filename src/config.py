@@ -22,7 +22,7 @@ class Config:
     S3_SCRIPTS_PREFIX: str = "scripts/"
     GLUE_DATABASE_NAME: str = "employee_db"
     GLUE_CRAWLER_NAME: str = "employee-csv-crawler"
-    GLUE_TABLE_NAME: str = "raw_employees"
+    GLUE_TABLE_NAME: str = "employees"
     GLUE_IAM_ROLE_NAME: str = "AWSGlueRole-EmployeeETL"
     DYNAMODB_TABLE_NAME: str = "Employees"
     LOCAL_DATA_FILE: str = "data/employee_data.csv"

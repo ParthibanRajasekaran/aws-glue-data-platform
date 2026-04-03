@@ -68,15 +68,15 @@ def test_crawler_reaches_ready(live_config):
 @pytest.mark.integration
 def test_catalog_table_registered(live_config):
     """get_catalog_table should return the table dict without raising."""
-    table = glue_setup.get_catalog_table(live_config, "raw_employees")
-    assert table["Name"] == "raw_employees"
+    table = glue_setup.get_catalog_table(live_config, live_config.GLUE_TABLE_NAME)
+    assert table["Name"] == live_config.GLUE_TABLE_NAME
     assert table["DatabaseName"] == live_config.GLUE_DATABASE_NAME
 
 
 @pytest.mark.integration
 def test_catalog_table_column_count(live_config):
     """The catalogued table should have at least 10 columns (CSV has 12)."""
-    table = glue_setup.get_catalog_table(live_config, "raw_employees")
+    table = glue_setup.get_catalog_table(live_config, live_config.GLUE_TABLE_NAME)
     columns = table.get("StorageDescriptor", {}).get("Columns", [])
     assert len(columns) >= 10, (
         f"Expected at least 10 columns, got {len(columns)}: {[c['Name'] for c in columns]}"
