@@ -45,7 +45,9 @@ def test_create_crawler_reconciles_existing():
     assert "S3Targets" in update_kwargs["Targets"]
     assert update_kwargs["Targets"]["S3Targets"][0]["Path"].endswith(config.S3_RAW_PREFIX)
     assert "RecrawlPolicy" in update_kwargs
+    assert update_kwargs["RecrawlPolicy"]
     assert "SchemaChangePolicy" in update_kwargs
+    assert update_kwargs["SchemaChangePolicy"]
 
 
 @pytest.mark.unit
