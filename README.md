@@ -27,50 +27,92 @@ See [VERIFICATION.md](VERIFICATION.md) for the full CLI audit trail and the thre
 
 ![Data Access Architecture](docs/images/data-access.png)
 
-### Data Model - Raw CSV to Dual Sink
+### End-to-End Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Source["Source Layer - S3 Raw Bucket"]
-        EMP["📄 employees.csv\nemployeeid · firstname · lastname · email\ndeptid · managerid · jobtitle · salary\nhiredate · city · state · employmentstatus"]
-        DEPT["📄 departments.csv\ndeptid · departmentname\nmaxsalaryrange · minsalaryrange · budget"]
-        MGR["📄 managers.csv\nmanagerid · managername · isactive · level"]
+    subgraph Config["Zero-Trust Config"]
+        SSM["SSM Parameter Store\nAll resource names resolved at runtime\nNo hardcoded ARNs in source code"]
     end
 
-    subgraph Catalog["Glue Data Catalog - hr_analytics"]
-        CT["CfnTable schema authority\nraw_employees · raw_departments · raw_managers\nAll columns lowercase · Format: CSV"]
+    subgraph Phase1["Phase 1 - Standalone Provisioner (pipeline_runner.py only)"]
+        S3RAW["S3 Raw Bucket\nSSE-S3 encryption · Versioning\nAll public access blocked"]
+        IAM["IAM Role: AWSGlueRole-EmployeeETL\nAWSGlueServiceRole (managed)\nScoped inline: GetObject/PutObject/ListBucket"]
+        CRAWLER["Glue Crawler: employee-csv-crawler\nTargets raw/employees/\nIdempotent - reconciles on re-run"]
+        DDB_TBL["DynamoDB: Employees (standalone schema)\nPAY_PER_REQUEST · PK: EmployeeID (Number)\nNot used by the CDK ETL path"]
     end
 
-    subgraph Transform["PySpark Transform - etl_job.py"]
-        LC["① _lowercase_columns()\nNormalise all column names to lowercase"]
-        J1["② Broadcast JOIN\nemployees ⟕ departments ON deptid\n+ departmentname · maxsalaryrange · minsalaryrange · budget"]
-        J2["③ Broadcast JOIN\nenriched ⟕ managers ON managerid\n+ managername · isactive · level"]
-        WIN["④ Window Function\nMAX salary OVER PARTITION BY jobtitle\n→ highesttitlesalary"]
-        CALC["⑤ Derived Columns\ncomparatio = ROUND salary / maxsalaryrange, 2\nrequiresreview = comparatio > 1.0 OR isactive = False"]
-        DQ["⑥ EvaluateDataQuality Gate\nIsComplete employeeid · ColumnValues salary > 0 · IsUnique employeeid\nFail-fast - no partial write on rule failure"]
-        TC["⑦ TitleCase Remapping\nemployeeid → EmployeeID · salary → Salary\nlevel → ManagerLevel · 24 columns total\nRestores API contract after internal lowercase processing"]
+    subgraph Sources["Source Layer - S3 Raw Bucket (KMS CMK)"]
+        EMP_CSV["employees.csv\nraw/employees/"]
+        DEPT_CSV["departments.csv\nraw/departments/"]
+        MGR_CSV["managers.csv\nraw/managers/"]
     end
 
-    subgraph DDB["DynamoDB - Operational Sink"]
-        DDB_MODEL["Single-Table Design\nPK: EMP#employeeid   SK: PROFILE\n─────────────────────────────\nEmployeeID · FirstName · LastName · Email\nJobTitle · Salary · HireDate · City · State\nDepartmentName · ManagerName · ManagerLevel\nCompaRatio · HighestTitleSalary · RequiresReview\n─────────────────────────────\nAccess pattern: GetItem by EMP#id → Lambda API"]
+    subgraph Catalog["Glue Data Catalog - hr_analytics (CDK-deployed)"]
+        EMP_TBL["raw_employees\nCDK CfnTable - schema authority"]
+        DEPT_TBL["raw_departments\nCDK CfnTable - schema authority"]
+        MGR_TBL["raw_managers\nCDK CfnTable - schema authority"]
     end
 
-    subgraph PQ["S3 Parquet - Analytical Sink"]
-        PQ_MODEL["Hive-Partitioned Parquet\nyear= / month= / dept=\n─────────────────────────────\nAll 24 enriched columns · SNAPPY compressed\nPartitions auto-registered in Glue Catalog\n─────────────────────────────\nAccess pattern: Athena SQL · 100 MB scan guardrail"]
+    subgraph ETL["Phase 2 - PySpark ETL (Glue 4.0, G.1X x 2, Job Bookmarks ON)"]
+        LC["(1) _lowercase_columns()\nNormalise all column names"]
+        J1["(2) Broadcast JOIN\nemployees left-outer departments ON deptid"]
+        J2["(3) Broadcast JOIN\nenriched left-outer managers ON managerid"]
+        WIN["(4) Window Function\nMAX salary OVER PARTITION BY jobtitle"]
+        CALC["(5) Derived Columns\ncomparatio = ROUND salary / maxsalaryrange, 2\nrequiresreview = comparatio > 1.0 OR isactive = False"]
+        DQ["(6) EvaluateDataQuality Gate\nIsComplete(employeeid) · salary > 0 · IsUnique(employeeid)\nCircuit breaker - fail-fast on any violation"]
+        TC["(7) TitleCase Remap\n24 columns total · Restores API contract"]
     end
 
-    Source --> Catalog
-    Catalog --> LC
-    LC --> J1
-    J1 --> J2
-    J2 --> WIN
-    WIN --> CALC
-    CALC --> DQ
-    DQ -->|"All rules PASS"| TC
-    DQ -->|"Any rule FAILS"| ABORT["🚫 Job Abort\nNo write to either sink"]
-    TC --> DDB_MODEL
-    DQ -->|"Clean rows only\nafter circuit breaker"| PQ_MODEL
+    subgraph Sinks["Dual Sink"]
+        ATOMIC["_atomic_parquet_write()\nStage to _staging/ prefix\nVerify row count\nRename to final prefix (atomic swap)"]
+        S3PQ["S3 Parquet Bucket (KMS CMK)\nyear= / month= / dept= partitions\nSNAPPY compressed\nAthena workgroup: 100 MB scan guardrail"]
+        DDB_WRITE["DynamoDB: aws-glue-demo-single-table\nPK (STRING) / SK (STRING)\nKMS CMK · PAY_PER_REQUEST"]
+        QUAR["S3 Quarantine Bucket (KMS CMK)\nDQ-rejected rows only\nIsolated from clean data path"]
+    end
+
+    subgraph Consumer["API Consumer"]
+        LAMBDA["Lambda: GetEmployee\nGetItem by PK=EMP#id SK=PROFILE\nSSM-resolved table name"]
+        API["API Gateway\nREST endpoint"]
+    end
+
+    subgraph Observe["Observability"]
+        CW["CloudWatch\nHRPipeline/ReconciliationMismatch\nGlue job duration + error metrics"]
+        SNS["SNS: hr-pipeline-alerts\nEmail subscription\nCloudWatch alarm trigger"]
+    end
+
+    SSM -->|"resource names"| ETL
+    SSM -->|"resource names"| LAMBDA
+
+    EMP_CSV --> EMP_TBL
+    DEPT_CSV --> DEPT_TBL
+    MGR_CSV --> MGR_TBL
+
+    EMP_TBL & DEPT_TBL & MGR_TBL --> LC
+    LC --> J1 --> J2 --> WIN --> CALC --> DQ
+
+    DQ -->|"all rules PASS"| TC
+    DQ -->|"any rule FAILS"| QUAR
+    TC --> DDB_WRITE
+    TC --> ATOMIC --> S3PQ
+
+    DDB_WRITE --> DDB_TBL
+    DDB_TBL --> LAMBDA --> API
+
+    DDB_WRITE & S3PQ --> CW --> SNS
 ```
+
+### Data Model - Transform Steps
+
+| Step | Operation | Output columns added |
+|---|---|---|
+| (1) lowercase | Normalise all headers | - |
+| (2) JOIN departments | Left-outer on `deptid` | `departmentname · maxsalaryrange · minsalaryrange · budget` |
+| (3) JOIN managers | Left-outer on `managerid` | `managername · isactive · level` |
+| (4) Window | MAX salary OVER jobtitle | `highesttitlesalary` |
+| (5) Derived | Arithmetic + boolean | `comparatio · requiresreview` |
+| (6) DQ gate | Circuit breaker | - (quarantine bad rows) |
+| (7) TitleCase | API contract remap | 24 final columns |
 
 ---
 

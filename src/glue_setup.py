@@ -1,4 +1,5 @@
 """Glue Data Catalog setup utilities for the Employee ETL pipeline."""
+
 import logging
 import time
 
@@ -23,6 +24,10 @@ class CrawlerFailedError(Exception):
 
 class TableNotFoundError(Exception):
     """Raised when a requested Glue catalog table does not exist."""
+
+
+class CrawlerConfigurationError(Exception):
+    """Raised when an existing crawler has unsafe configuration drift."""
 
 
 def _session(config: Config) -> boto3.Session:
@@ -68,12 +73,28 @@ def create_crawler(config: Config, role_arn: str) -> None:
             RecrawlPolicy={"RecrawlBehavior": "CRAWL_EVERYTHING"},
             Description="Crawls raw employee CSV data from S3",
         )
-        logger.info(
-            "Created Glue crawler '%s' targeting %s", crawler_name, target_path
-        )
+        logger.info("Created Glue crawler '%s' targeting %s", crawler_name, target_path)
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "AlreadyExistsException":
-            logger.info("Glue crawler already exists: %s", crawler_name)
+            logger.info("Glue crawler already exists: %s - reconciling config", crawler_name)
+            existing = glue.get_crawler(Name=crawler_name)["Crawler"]
+            if existing.get("Schedule"):
+                raise CrawlerConfigurationError(
+                    f"Crawler '{crawler_name}' has a schedule configured. "
+                    "Disable the schedule before running this pipeline."
+                )
+            glue.update_crawler(
+                Name=crawler_name,
+                Role=role_arn,
+                DatabaseName=config.GLUE_DATABASE_NAME,
+                Targets={"S3Targets": [{"Path": target_path}]},
+                SchemaChangePolicy={
+                    "UpdateBehavior": "LOG",
+                    "DeleteBehavior": "LOG",
+                },
+                RecrawlPolicy={"RecrawlBehavior": "CRAWL_EVERYTHING"},
+            )
+            logger.info("Reconciled crawler '%s' with desired config", crawler_name)
         else:
             raise
 
@@ -93,14 +114,38 @@ def run_crawler(config: Config) -> None:
     # Check current state before starting
     info = glue.get_crawler(Name=crawler_name)["Crawler"]
     state = info.get("State", "READY")
-    if state == "RUNNING":
-        logger.warning(
-            "Crawler '%s' is already RUNNING – skipping start.", crawler_name
-        )
-        return
 
-    glue.start_crawler(Name=crawler_name)
-    logger.info("Started Glue crawler: %s", crawler_name)
+    if state == "RUNNING":
+        logger.warning("Crawler '%s' is already RUNNING – waiting for completion.", crawler_name)
+    else:
+        if state == "STOPPING":
+            logger.warning(
+                "Crawler '%s' is STOPPING – waiting until READY before starting.", crawler_name
+            )
+            for poll in range(1, _MAX_POLLS + 1):
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                info = glue.get_crawler(Name=crawler_name)["Crawler"]
+                state = info.get("State", "UNKNOWN")
+                logger.info(
+                    "Crawler '%s' – pre-start poll %d/%d – state: %s",
+                    crawler_name,
+                    poll,
+                    _MAX_POLLS,
+                    state,
+                )
+                if state == "READY":
+                    break
+                if state != "STOPPING":
+                    raise CrawlerFailedError(
+                        f"Crawler '{crawler_name}' entered unexpected state before start: {state}"
+                    )
+            else:
+                raise CrawlerTimeoutError(
+                    f"Crawler '{crawler_name}' did not become READY within "
+                    f"{_MAX_POLLS * _POLL_INTERVAL_SECONDS} seconds."
+                )
+        glue.start_crawler(Name=crawler_name)
+        logger.info("Started Glue crawler: %s", crawler_name)
 
     for poll in range(1, _MAX_POLLS + 1):
         time.sleep(_POLL_INTERVAL_SECONDS)
@@ -108,7 +153,10 @@ def run_crawler(config: Config) -> None:
         current_state = info.get("State", "UNKNOWN")
         logger.info(
             "Crawler '%s' – poll %d/%d – state: %s",
-            crawler_name, poll, _MAX_POLLS, current_state,
+            crawler_name,
+            poll,
+            _MAX_POLLS,
+            current_state,
         )
 
         if current_state == "READY":
@@ -158,7 +206,9 @@ def get_catalog_table(config: Config, table_name: str) -> dict:
         col_count = len(table.get("StorageDescriptor", {}).get("Columns", []))
         logger.info(
             "Found catalog table %s.%s (%d columns)",
-            config.GLUE_DATABASE_NAME, table_name, col_count,
+            config.GLUE_DATABASE_NAME,
+            table_name,
+            col_count,
         )
         return table
     except ClientError as exc:

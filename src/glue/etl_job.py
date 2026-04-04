@@ -15,6 +15,7 @@ HR ETL PySpark Job — Phase 4
 - Null safety: na.fill() guards on all string/double columns before DynamoDB PutItem
 - Hive-partitioned Parquet output (year / month / dept) for cost-efficient Athena queries
 """
+
 import os
 import sys
 
@@ -22,8 +23,8 @@ import boto3
 from awsglue.context import GlueContext
 from awsglue.dynamicframe import DynamicFrame
 from awsglue.job import Job
-from awsgluedq.transforms import EvaluateDataQuality
 from awsglue.utils import getResolvedOptions
+from awsgluedq.transforms import EvaluateDataQuality
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 from pyspark.sql.types import DateType, DoubleType, StringType
@@ -40,6 +41,7 @@ job.init(args["JOB_NAME"], args)
 logger = glueContext.get_logger()
 
 # ── Configuration from SSM Parameter Store (Zero-Trust: no hardcoded names) ──
+
 
 def _fetch_ssm_config() -> dict:
     client = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1"))
@@ -63,6 +65,7 @@ QUARANTINE_BASE = f"s3://{_ssm['quarantine-bucket-name']}"
 # ── Step 1: Read source tables via Glue Catalog (enables lineage + bookmarks) ─
 # Schema is authoritative in CDK CfnTable definitions — no inferSchema scan needed.
 # transformation_ctx values are required for Job Bookmark tracking per source.
+
 
 def _lowercase_columns(df):
     """Normalise all column names to lowercase.
@@ -98,6 +101,7 @@ managers = _lowercase_columns(managers_dyf.toDF())
 
 # ── Step 2: Silver layer — null guard + explicit type casts ──────────────────
 
+
 def clean_data(df, id_col: str):
     """Drop rows with null primary key; cast hiredate to DateType if present.
 
@@ -111,8 +115,7 @@ def clean_data(df, id_col: str):
     """
     if id_col not in df.columns:
         raise ValueError(
-            f"clean_data: column '{id_col}' not found. "
-            f"Available columns: {df.columns}"
+            f"clean_data: column '{id_col}' not found. " f"Available columns: {df.columns}"
         )
     df = df.filter(F.col(id_col).isNotNull())
     if "hiredate" in df.columns:
@@ -124,15 +127,13 @@ employees = clean_data(employees, "employeeid")
 
 # Type normalisation: join keys must be string; salary/ranges to double for maths
 employees = (
-    employees
-    .withColumn("deptid",    F.col("deptid").cast("string"))
+    employees.withColumn("deptid", F.col("deptid").cast("string"))
     .withColumn("managerid", F.col("managerid").cast("string"))
-    .withColumn("salary",    F.col("salary").cast("double"))
+    .withColumn("salary", F.col("salary").cast("double"))
 )
 
 departments = (
-    departments
-    .withColumn("deptid",         F.col("deptid").cast("string"))
+    departments.withColumn("deptid", F.col("deptid").cast("string"))
     .withColumn("maxsalaryrange", F.col("maxsalaryrange").cast("double"))
     .withColumn("minsalaryrange", F.col("minsalaryrange").cast("double"))
 )
@@ -142,9 +143,9 @@ managers = managers.withColumn("managerid", F.col("managerid").cast("string"))
 # ── Step 3: Broadcast joins — eliminates shuffle on small lookup tables ───────
 # departments: 6 rows, managers: 100 rows — both fit in executor memory
 enriched = employees.join(
-    F.broadcast(departments.select(
-        "deptid", "departmentname", "maxsalaryrange", "minsalaryrange", "budget"
-    )),
+    F.broadcast(
+        departments.select("deptid", "departmentname", "maxsalaryrange", "minsalaryrange", "budget")
+    ),
     on="deptid",
     how="left",
 )
@@ -168,10 +169,14 @@ enriched = enriched.withColumn(
     F.round(F.col("salary") / F.col("maxsalaryrange"), 2),
 )
 
-# isactive is stored as the string "True" / "False" — never cast to boolean
+# isactive is stored as the string "True" / "False" — never cast to boolean.
+# isactive null means the LEFT JOIN found no matching manager row; unknown
+# supervision is treated as a risk requiring HR review.
 enriched = enriched.withColumn(
     "requiresreview",
-    (F.col("comparatio") > F.lit(1.0)) | (F.col("isactive") == F.lit("False")),
+    (F.col("comparatio") > F.lit(1.0))
+    | (F.col("isactive") == F.lit("False"))
+    | F.col("isactive").isNull(),
 )
 
 # ── Step 6: Data Quality gate — fail-fast before writing to any sink ──────────
@@ -206,9 +211,7 @@ dq_result = EvaluateDataQuality.apply(
 )
 
 failed_rules = (
-    dq_result.select_fields(["Rule", "Outcome"])
-    .toDF()
-    .filter(F.col("Outcome") == F.lit("Failed"))
+    dq_result.select_fields(["Rule", "Outcome"]).toDF().filter(F.col("Outcome") == F.lit("Failed"))
 )
 if failed_rules.count() > 0:
     failed_rules.show(truncate=False)
@@ -229,6 +232,7 @@ _bad_rows = enriched.filter(
     F.col("employeeid").isNull()
     | F.col("salary").isNull()
     | (F.col("salary") <= 0)
+    | F.col("comparatio").isNull()  # unmatched dept — cannot assess pay-band compliance
 )
 _bad_count = _bad_rows.count()
 if _bad_count > 0:
@@ -238,12 +242,11 @@ if _bad_count > 0:
         "— these rows will NOT reach DynamoDB or Parquet."
     )
     # Cast hiredate back to string so JSON serialisation does not fail on DateType.
-    _quarantine_df = _bad_rows.withColumn(
-        "hiredate", F.col("hiredate").cast("string")
-    ).withColumn(
+    _quarantine_df = _bad_rows.withColumn("hiredate", F.col("hiredate").cast("string")).withColumn(
         "_quarantine_reason",
         F.when(F.col("employeeid").isNull(), F.lit("null_employeeid"))
         .when(F.col("salary").isNull(), F.lit("null_salary"))
+        .when(F.col("comparatio").isNull(), F.lit("null_comparatio_unmatched_dept"))
         .otherwise(F.lit("negative_salary")),
     )
     glueContext.write_dynamic_frame.from_options(
@@ -254,20 +257,35 @@ if _bad_count > 0:
         },
         format="json",
     )
+    # Publish a metric so the QuarantinedRowsAlarm fires immediately — the post-ETL
+    # reconciliation script catches count mismatches, but this gives sub-minute
+    # alerting for any individual run that quarantines rows.
+    boto3.client(
+        "cloudwatch", region_name=os.environ.get("AWS_REGION", "us-east-1")
+    ).put_metric_data(
+        Namespace="HRPipeline",
+        MetricData=[
+            {
+                "MetricName": "QuarantinedRowCount",
+                "Value": float(_bad_count),
+                "Unit": "Count",
+            }
+        ],
+    )
 
 # Only rows with a clean RowOutcome proceed to both sinks.
 enriched = enriched.filter(
     F.col("employeeid").isNotNull()
     & F.col("salary").isNotNull()
     & (F.col("salary") > 0)
+    & F.col("comparatio").isNotNull()
 )
 
 # ── Step 7: DynamoDB sink via native Glue DynamicFrame connector ──────────────
 # DateType not serialisable by the DDB connector — cast HireDate back to string.
 # PK/SK added as DynamoDB composite key attributes.
 dynamo_df = (
-    enriched
-    .withColumn("hiredate", F.col("hiredate").cast("string"))
+    enriched.withColumn("hiredate", F.col("hiredate").cast("string"))
     .withColumn("PK", F.concat(F.lit("EMP#"), F.col("employeeid").cast("string")))
     .withColumn("SK", F.lit("PROFILE"))
 )
@@ -278,30 +296,30 @@ dynamo_df = (
 # item.get("EmployeeID"), item.get("Salary"), etc.
 # "level" from the managers table maps to "ManagerLevel" to match the API contract.
 _DYNAMO_RENAME = {
-    "employeeid":         "EmployeeID",
-    "firstname":          "FirstName",
-    "lastname":           "LastName",
-    "email":              "Email",
-    "deptid":             "DeptID",
-    "department":         "Department",
-    "jobtitle":           "JobTitle",
-    "salary":             "Salary",
-    "hiredate":           "HireDate",
-    "city":               "City",
-    "state":              "State",
-    "employmentstatus":   "EmploymentStatus",
-    "managerid":          "ManagerID",
-    "manager":            "Manager",
-    "departmentname":     "DepartmentName",
-    "maxsalaryrange":     "MaxSalaryRange",
-    "minsalaryrange":     "MinSalaryRange",
-    "budget":             "Budget",
-    "managername":        "ManagerName",
-    "isactive":           "IsActive",
-    "level":              "ManagerLevel",
+    "employeeid": "EmployeeID",
+    "firstname": "FirstName",
+    "lastname": "LastName",
+    "email": "Email",
+    "deptid": "DeptID",
+    "department": "Department",
+    "jobtitle": "JobTitle",
+    "salary": "Salary",
+    "hiredate": "HireDate",
+    "city": "City",
+    "state": "State",
+    "employmentstatus": "EmploymentStatus",
+    "managerid": "ManagerID",
+    "manager": "Manager",
+    "departmentname": "DepartmentName",
+    "maxsalaryrange": "MaxSalaryRange",
+    "minsalaryrange": "MinSalaryRange",
+    "budget": "Budget",
+    "managername": "ManagerName",
+    "isactive": "IsActive",
+    "level": "ManagerLevel",
     "highesttitlesalary": "HighestTitleSalary",
-    "comparatio":         "CompaRatio",
-    "requiresreview":     "RequiresReview",
+    "comparatio": "CompaRatio",
+    "requiresreview": "RequiresReview",
 }
 for old, new in _DYNAMO_RENAME.items():
     if old in dynamo_df.columns:
@@ -340,11 +358,14 @@ glueContext.write_dynamic_frame.from_options(
 #   - Salary is NOT masked: it is the primary analytical metric and is already
 #     controlled by IAM (only the Glue role and Lambda role can read the data).
 parquet_df = (
-    enriched
-    .withColumn("year",     F.year(F.col("hiredate")))
-    .withColumn("month",    F.month(F.col("hiredate")))
-    .withColumn("dept",     F.col("deptid"))
+    enriched.withColumn("year", F.year(F.col("hiredate")))
+    .withColumn("month", F.month(F.col("hiredate")))
+    .withColumn("dept", F.col("deptid"))
     .withColumn("lastname", F.sha2(F.col("lastname").cast("string"), 256))
+    # Email is personal data under UK GDPR (ICO guidance) — pseudonymise in the
+    # analytical sink alongside LastName.  The DynamoDB operational sink retains
+    # plain-text email so the HR API can surface contact details to authorised callers.
+    .withColumn("email", F.sha2(F.col("email").cast("string"), 256))
 )
 
 # ── Step 8a: Atomic Parquet write — staging + swap ───────────────────────────
@@ -406,8 +427,7 @@ def _atomic_parquet_write(
     # ── Phase 1: Write to staging (production is untouched if this fails) ────
     logger.info(f"[AtomicWrite] Phase 1 — Staging write to {staging_path}")
     (
-        parquet_df.write
-        .mode("overwrite")
+        parquet_df.write.mode("overwrite")
         .option("compression", "snappy")
         .partitionBy("year", "month", "dept")
         .parquet(staging_path)
@@ -418,8 +438,7 @@ def _atomic_parquet_write(
     staging_parquet_keys = []
     for page in paginator.paginate(Bucket=bucket_name, Prefix=f"{staging_prefix}/"):
         staging_parquet_keys.extend(
-            obj["Key"] for obj in page.get("Contents", [])
-            if obj["Key"].endswith(".parquet")
+            obj["Key"] for obj in page.get("Contents", []) if obj["Key"].endswith(".parquet")
         )
     if not staging_parquet_keys:
         raise RuntimeError(
@@ -427,8 +446,7 @@ def _atomic_parquet_write(
             "Production is untouched — reset the job bookmark and replay."
         )
     logger.info(
-        f"[AtomicWrite] Phase 2 — Verified: {len(staging_parquet_keys)} "
-        "staging file(s) ready."
+        f"[AtomicWrite] Phase 2 — Verified: {len(staging_parquet_keys)} " "staging file(s) ready."
     )
 
     # ── Phase 3: Swap — purge prod partitions; server-side copy staging → prod ─
@@ -440,8 +458,7 @@ def _atomic_parquet_write(
     # N separate list_objects_v2 calls (one per partition).  The affected set
     # lookup is O(1) per key — far faster than 542 individual ListBucket calls.
     affected_set = {
-        (str(row["year"]), str(row["month"]), str(row["dept"]))
-        for row in affected_partitions
+        (str(row["year"]), str(row["month"]), str(row["dept"])) for row in affected_partitions
     }
 
     def _partition_tuple_from_key(key):
@@ -451,9 +468,9 @@ def _atomic_parquet_write(
         if len(parts) < 5:
             return None
         try:
-            year  = parts[1].split("=")[1]
+            year = parts[1].split("=")[1]
             month = parts[2].split("=")[1]
-            dept  = parts[3].split("=")[1]
+            dept = parts[3].split("=")[1]
             return (year, month, dept)
         except IndexError:
             return None
@@ -468,13 +485,13 @@ def _atomic_parquet_write(
     for i in range(0, len(keys_to_delete), 1000):
         s3.delete_objects(
             Bucket=bucket_name,
-            Delete={"Objects": keys_to_delete[i:i + 1000]},
+            Delete={"Objects": keys_to_delete[i : i + 1000]},
         )
         purge_count += min(1000, len(keys_to_delete) - i)
 
     # 3b: Server-side copy staging Parquet files to production (no egress cost)
     for staging_key in staging_parquet_keys:
-        prod_key = prod_prefix + staging_key[len(staging_prefix):]
+        prod_key = prod_prefix + staging_key[len(staging_prefix) :]
         s3.copy_object(
             Bucket=bucket_name,
             CopySource={"Bucket": bucket_name, "Key": staging_key},
@@ -489,13 +506,11 @@ def _atomic_parquet_write(
     # 3c: Purge all staging objects (including Spark's _SUCCESS marker)
     all_staging_keys = []
     for page in paginator.paginate(Bucket=bucket_name, Prefix=f"{staging_prefix}/"):
-        all_staging_keys.extend(
-            {"Key": obj["Key"]} for obj in page.get("Contents", [])
-        )
+        all_staging_keys.extend({"Key": obj["Key"]} for obj in page.get("Contents", []))
     for i in range(0, len(all_staging_keys), 1000):  # delete_objects max 1000
         s3.delete_objects(
             Bucket=bucket_name,
-            Delete={"Objects": all_staging_keys[i:i + 1000]},
+            Delete={"Objects": all_staging_keys[i : i + 1000]},
         )
 
     # ── Phase 4: Register / update partitions in Glue Data Catalog ───────────
@@ -510,12 +525,8 @@ def _atomic_parquet_write(
                     f"s3://{bucket_name}/{prod_prefix}"
                     f"/year={row['year']}/month={row['month']}/dept={row['dept']}/"
                 ),
-                "InputFormat": (
-                    "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-                ),
-                "OutputFormat": (
-                    "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
-                ),
+                "InputFormat": ("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"),
+                "OutputFormat": ("org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"),
                 "SerdeInfo": {
                     "SerializationLibrary": (
                         "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
@@ -529,7 +540,7 @@ def _atomic_parquet_write(
     ]
 
     for i in range(0, len(partition_inputs), 100):  # BatchCreatePartition max 100
-        batch = partition_inputs[i:i + 100]
+        batch = partition_inputs[i : i + 100]
         response = glue_client.batch_create_partition(
             DatabaseName=glue_database,
             TableName=glue_table,

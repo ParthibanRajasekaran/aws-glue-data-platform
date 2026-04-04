@@ -18,7 +18,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install pre-commit pytest boto3 "moto[dynamodb,ssm]>=5.0.0"
+        run: pip install pre-commit pytest boto3 "moto[s3,iam,dynamodb,ssm]>=5.0.0"
 
       - name: Lint (black, isort, ruff, detect-secrets)
         run: pre-commit run --all-files

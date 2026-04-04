@@ -1,4 +1,5 @@
 """IAM setup utilities for the Employee ETL pipeline."""
+
 import json
 import logging
 
@@ -9,20 +10,21 @@ from src.config import Config
 
 logger = logging.getLogger(__name__)
 
-_TRUST_POLICY = json.dumps({
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {"Service": "glue.amazonaws.com"},
-            "Action": "sts:AssumeRole",
-        }
-    ],
-})
+_TRUST_POLICY = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "glue.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+)
 
 _MANAGED_POLICIES = [
     "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole",
-    "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess",
 ]
 
 
@@ -56,7 +58,7 @@ def create_glue_role(config: Config) -> str:
 
 
 def attach_glue_policies(config: Config, role_name: str) -> None:
-    """Attach AWSGlueServiceRole and AmazonDynamoDBFullAccess managed policies. Idempotent."""
+    """Attach required managed policies for Glue service role. Idempotent."""
     iam = _session(config).client("iam")
 
     for policy_arn in _MANAGED_POLICIES:
@@ -75,25 +77,30 @@ def attach_glue_policies(config: Config, role_name: str) -> None:
 
 
 def put_s3_inline_policy(config: Config, role_name: str) -> None:
-    """Put an inline S3 policy scoped to the pipeline bucket. Idempotent by nature of put_role_policy."""
+    """Put an inline S3 policy scoped to the pipeline bucket.
+
+    Idempotent by nature of put_role_policy.
+    """
     iam = _session(config).client("iam")
     bucket = config.S3_BUCKET_NAME
 
-    policy_document = json.dumps({
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:PutObject"],
-                "Resource": f"arn:aws:s3:::{bucket}/*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["s3:ListBucket"],
-                "Resource": f"arn:aws:s3:::{bucket}",
-            },
-        ],
-    })
+    policy_document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:PutObject"],
+                    "Resource": f"arn:aws:s3:::{bucket}/*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:ListBucket"],
+                    "Resource": f"arn:aws:s3:::{bucket}",
+                },
+            ],
+        }
+    )
 
     iam.put_role_policy(
         RoleName=role_name,
@@ -118,7 +125,6 @@ def get_role_arn(config: Config) -> str:
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchEntity":
             raise RuntimeError(
-                f"IAM role '{role_name}' does not exist. "
-                "Run create_glue_role() first."
+                f"IAM role '{role_name}' does not exist. " "Run create_glue_role() first."
             ) from exc
         raise

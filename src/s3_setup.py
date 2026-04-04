@@ -1,4 +1,5 @@
 """S3 setup utilities for the Employee ETL pipeline."""
+
 import logging
 import os
 
@@ -42,18 +43,21 @@ def create_bucket(config: Config) -> str:
         logger.info("Created S3 bucket: %s", bucket)
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
-        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+        if code == "BucketAlreadyOwnedByYou":
             logger.info("S3 bucket already exists (owned by this account): %s", bucket)
-        else:
+        elif code == "BucketAlreadyExists":
             raise BucketCreationError(
-                f"Failed to create bucket '{bucket}': {exc}"
+                f"Bucket name '{bucket}' is already taken by another AWS account. "
+                "Choose a different globally unique bucket name."
             ) from exc
+        else:
+            raise BucketCreationError(f"Failed to create bucket '{bucket}': {exc}") from exc
 
     return bucket
 
 
 def configure_bucket_security(config: Config) -> None:
-    """Enable versioning and block all public access on the bucket. Idempotent."""
+    """Enable baseline bucket security controls. Idempotent."""
     s3 = _session(config).client("s3")
     bucket = config.S3_BUCKET_NAME
 
@@ -75,6 +79,19 @@ def configure_bucket_security(config: Config) -> None:
         },
     )
     logger.info("Blocked all public access on bucket: %s", bucket)
+
+    # Enforce SSE-S3 encryption for all new objects
+    s3.put_bucket_encryption(
+        Bucket=bucket,
+        ServerSideEncryptionConfiguration={
+            "Rules": [
+                {
+                    "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"},
+                }
+            ]
+        },
+    )
+    logger.info("Enabled default SSE-S3 encryption on bucket: %s", bucket)
 
 
 def upload_file(config: Config, local_path: str, s3_key: str) -> str:
@@ -112,19 +129,32 @@ def upload_file(config: Config, local_path: str, s3_key: str) -> str:
     return uri
 
 
+class UploadVerificationError(Exception):
+    """Raised when upload verification fails for a non-404 reason (e.g. AccessDenied)."""
+
+
 def verify_upload(config: Config, s3_key: str) -> bool:
     """Check whether an object exists in the bucket.
 
     Returns:
-        True if the object exists, False otherwise. Never raises.
+        True if the object exists, False if it does not exist.
+
+    Raises:
+        UploadVerificationError: For any ClientError other than a 404/NoSuchKey
+            (e.g. AccessDenied, invalid credentials, network errors).  Swallowing
+            these would silently mask real pipeline configuration failures.
     """
     s3 = _session(config).client("s3")
     try:
         s3.head_object(Bucket=config.S3_BUCKET_NAME, Key=s3_key)
         logger.info("Verified object exists: s3://%s/%s", config.S3_BUCKET_NAME, s3_key)
         return True
-    except ClientError:
-        logger.warning(
-            "Object not found: s3://%s/%s", config.S3_BUCKET_NAME, s3_key
-        )
-        return False
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code in ("404", "NoSuchKey"):
+            logger.warning("Object not found: s3://%s/%s", config.S3_BUCKET_NAME, s3_key)
+            return False
+        raise UploadVerificationError(
+            f"Unexpected error verifying s3://{config.S3_BUCKET_NAME}/{s3_key}: "
+            f"{code} — {exc.response['Error'].get('Message', '')}"
+        ) from exc

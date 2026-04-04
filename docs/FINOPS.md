@@ -1,6 +1,6 @@
 # FinOps Strategy
 
-Cost was a first-class constraint from day one. Every infrastructure decision below has a measurable price tag attached — because a pipeline that works but runs unchecked is a pipeline that surprises you on your AWS bill.
+Cost was a first-class constraint from day one. Every infrastructure decision below has a measurable price tag attached. A pipeline that works but runs unchecked is a pipeline that surprises you on your AWS bill.
 
 | Decision | Rationale | Savings vs. default |
 |---|---|---|

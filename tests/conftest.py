@@ -1,7 +1,9 @@
 """Shared pytest fixtures and mark registrations."""
-import pytest
-import boto3
+
 from unittest.mock import patch
+
+import boto3
+import pytest
 
 
 def pytest_configure(config):
@@ -21,6 +23,7 @@ def config():
         mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
 
         from src.config import Config
+
         cfg = Config(aws_profile="glue-learner", aws_region="us-east-1")
 
     return cfg

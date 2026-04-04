@@ -6,9 +6,9 @@ Requires live AWS credentials and a completed deploy.sh run (outputs.json must e
 Run:
     pytest tests/e2e/test_pipeline_e2e.py -v -m e2e
 """
+
 import json
 import os
-import sys
 
 import boto3
 import pytest
@@ -54,6 +54,7 @@ pytestmark = pytest.mark.e2e
 
 # ── S3 Tests ──────────────────────────────────────────────────────────────────
 
+
 class TestS3Contents:
     EXPECTED_CSVS = [
         "employee_data_updated.csv",
@@ -75,12 +76,13 @@ class TestS3Contents:
     def test_parquet_output_exists(self, stack, s3):
         bucket = stack["ParquetBucketName"]
         response = s3.list_objects_v2(Bucket=bucket, Prefix="employees/", MaxKeys=1)
-        assert response.get("KeyCount", 0) > 0, (
-            "No Parquet files found — has the Glue job run successfully?"
-        )
+        assert (
+            response.get("KeyCount", 0) > 0
+        ), "No Parquet files found — has the Glue job run successfully?"
 
 
 # ── DynamoDB Tests ────────────────────────────────────────────────────────────
+
 
 class TestDynamoDB:
     def test_table_is_active(self, stack, dynamodb):
@@ -113,23 +115,28 @@ class TestDynamoDB:
         )
         item = response.get("Item", {})
         assert item, "EMP#1001 not found — ETL may not have written correctly"
-        expected_keys = {"PK", "SK", "EmployeeID", "FirstName", "LastName",
-                         "Salary", "CompaRatio", "RequiresReview"}
+        expected_keys = {
+            "PK",
+            "SK",
+            "EmployeeID",
+            "FirstName",
+            "LastName",
+            "Salary",
+            "CompaRatio",
+            "RequiresReview",
+        }
         for key in expected_keys:
             assert key in item, f"Missing key '{key}' in DynamoDB item"
 
     def test_billing_mode_is_pay_per_request(self, stack, dynamodb):
         table_name = stack["DynamoTableName"]
         response = dynamodb.describe_table(TableName=table_name)
-        billing = (
-            response["Table"]
-            .get("BillingModeSummary", {})
-            .get("BillingMode", "PROVISIONED")
-        )
+        billing = response["Table"].get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
         assert billing == "PAY_PER_REQUEST"
 
 
 # ── Lambda Tests ──────────────────────────────────────────────────────────────
+
 
 class TestLambda:
     def _invoke(self, lambda_client, function_name, payload: dict) -> dict:
@@ -155,8 +162,15 @@ class TestLambda:
         fn = stack["LambdaFunctionName"]
         result = self._invoke(lambda_client, fn, {"employee_id": "1001"})
         body = json.loads(result["body"])
-        required = {"Name", "Department", "JobTitle", "Manager",
-                    "Salary", "CompaRatio", "RequiresReview"}
+        required = {
+            "Name",
+            "Department",
+            "JobTitle",
+            "Manager",
+            "Salary",
+            "CompaRatio",
+            "RequiresReview",
+        }
         for field in required:
             assert field in body, f"Missing field '{field}' in Lambda response"
 

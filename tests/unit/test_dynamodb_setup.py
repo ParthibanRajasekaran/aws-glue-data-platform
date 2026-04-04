@@ -1,20 +1,23 @@
 """Unit tests for src/dynamodb_setup.py using moto."""
-import os
-import pytest
-from unittest.mock import patch, MagicMock
-from moto import mock_aws
+
+from unittest.mock import MagicMock, patch
 
 import boto3
+import pytest
 from botocore.exceptions import ClientError
+from moto import mock_aws
 
+from src.dynamodb_setup import BillingModeError
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_config():
     """Return a Config-like object that doesn't touch real AWS."""
     from src.config import Config
+
     obj = object.__new__(Config)
     obj.aws_profile = "glue-learner"
     obj.aws_region = "us-east-1"
@@ -34,26 +37,17 @@ def _moto_session(config):
     return boto3.Session(region_name=config.aws_region)
 
 
-from src.dynamodb_setup import (
-    TABLE_KEY_SCHEMA,
-    TABLE_ATTRIBUTE_DEFINITIONS,
-    BillingModeError,
-    TableActivationTimeoutError,
-    create_table,
-    wait_for_table_active,
-    get_table_status,
-)
-
-
 # ---------------------------------------------------------------------------
 # create_table
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.unit
 @mock_aws
 def test_create_table_partition_key():
     """The Employees table should use EmployeeID (N) as the HASH key."""
     import src.dynamodb_setup as mod
+
     config = _make_config()
 
     with patch.object(mod, "_session", side_effect=_moto_session):
@@ -63,7 +57,7 @@ def test_create_table_partition_key():
     desc = ddb.describe_table(TableName="Employees")["Table"]
 
     key_schema = {k["AttributeName"]: k["KeyType"] for k in desc["KeySchema"]}
-    attr_types  = {a["AttributeName"]: a["AttributeType"] for a in desc["AttributeDefinitions"]}
+    attr_types = {a["AttributeName"]: a["AttributeType"] for a in desc["AttributeDefinitions"]}
 
     assert key_schema.get("EmployeeID") == "HASH"
     assert attr_types.get("EmployeeID") == "N"
@@ -74,6 +68,7 @@ def test_create_table_partition_key():
 def test_create_table_billing_mode():
     """The Employees table should be created with PAY_PER_REQUEST billing."""
     import src.dynamodb_setup as mod
+
     config = _make_config()
 
     with patch.object(mod, "_session", side_effect=_moto_session):
@@ -91,6 +86,7 @@ def test_create_table_billing_mode():
 def test_create_table_idempotent():
     """Calling create_table twice should not raise and should return the same ARN."""
     import src.dynamodb_setup as mod
+
     config = _make_config()
 
     with patch.object(mod, "_session", side_effect=_moto_session):
@@ -105,15 +101,19 @@ def test_create_table_idempotent():
 # BillingModeError on PROVISIONED
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.unit
 def test_billing_mode_error_on_provisioned():
     """create_table should raise BillingModeError if an existing table uses PROVISIONED billing."""
     import src.dynamodb_setup as mod
+
     config = _make_config()
 
     mock_client = MagicMock()
 
-    error_response = {"Error": {"Code": "ResourceInUseException", "Message": "Table already exists"}}
+    error_response = {
+        "Error": {"Code": "ResourceInUseException", "Message": "Table already exists"}
+    }
     mock_client.create_table.side_effect = ClientError(error_response, "CreateTable")
     mock_client.describe_table.return_value = {
         "Table": {
@@ -135,14 +135,35 @@ def test_billing_mode_error_on_provisioned():
 # wait_for_table_active
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.unit
 @mock_aws
 def test_wait_for_table_active():
     """wait_for_table_active should return once the table is ACTIVE."""
     import src.dynamodb_setup as mod
+
     config = _make_config()
 
     with patch.object(mod, "_session", side_effect=_moto_session):
         mod.create_table(config)
         # moto sets the table to ACTIVE immediately
         mod.wait_for_table_active(config, timeout_seconds=30)
+
+
+@pytest.mark.unit
+def test_assert_pay_per_request_raises_for_provisioned():
+    """Pre-flight guard should raise if table billing mode is PROVISIONED."""
+    import src.dynamodb_setup as mod
+
+    config = _make_config()
+
+    mock_client = MagicMock()
+    mock_client.describe_table.return_value = {
+        "Table": {"BillingModeSummary": {"BillingMode": "PROVISIONED"}}
+    }
+    mock_session = MagicMock()
+    mock_session.client.return_value = mock_client
+
+    with patch.object(mod, "_session", return_value=mock_session):
+        with pytest.raises(BillingModeError):
+            mod.assert_pay_per_request(config)

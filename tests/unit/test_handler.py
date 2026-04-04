@@ -2,6 +2,7 @@
 Unit tests for src/lambda/handler.py
 All AWS calls are mocked — no real credentials or network required.
 """
+
 import importlib.util
 import json
 import os
@@ -13,16 +14,16 @@ from unittest.mock import MagicMock, patch
 # 'lambda' is a Python reserved keyword so we can't do `from src.lambda import handler`.
 # We load it by file path instead.
 
-_HANDLER_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "..", "src", "lambda", "handler.py"
-)
+_HANDLER_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "src", "lambda", "handler.py")
 
 _mock_dynamodb = MagicMock()
 _mock_ssm = MagicMock()
 _mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "test-table"}}
 
-with patch("boto3.client", return_value=_mock_ssm), \
-     patch("boto3.resource", return_value=_mock_dynamodb):
+with (
+    patch("boto3.client", return_value=_mock_ssm),
+    patch("boto3.resource", return_value=_mock_dynamodb),
+):
     _spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
@@ -55,6 +56,7 @@ SAMPLE_ITEM = {
 
 
 # ── Tests: valid employee ID ───────────────────────────────────────────────────
+
 
 class TestHandlerValidId(unittest.TestCase):
     """Handler returns 200 with the correct payload for a known employee."""
@@ -98,12 +100,11 @@ class TestHandlerValidId(unittest.TestCase):
 
     def test_dynamo_called_with_correct_key(self):
         handler({"employee_id": "1001"}, None)
-        self._table.get_item.assert_called_once_with(
-            Key={"PK": "EMP#1001", "SK": "PROFILE"}
-        )
+        self._table.get_item.assert_called_once_with(Key={"PK": "EMP#1001", "SK": "PROFILE"})
 
 
 # ── Tests: missing employee_id field ─────────────────────────────────────────
+
 
 class TestHandlerMissingId(unittest.TestCase):
     """Handler returns 400 when employee_id is absent or None."""
@@ -120,6 +121,7 @@ class TestHandlerMissingId(unittest.TestCase):
 
 
 # ── Tests: employee not found in DynamoDB ─────────────────────────────────────
+
 
 class TestHandlerNotFound(unittest.TestCase):
     """Handler returns 404 when DynamoDB has no matching item."""
@@ -143,6 +145,7 @@ class TestHandlerNotFound(unittest.TestCase):
 
 # ── Tests: SSM failure at cold start ─────────────────────────────────────────
 
+
 class TestHandlerSsmFailure(unittest.TestCase):
     """Module-level SSM fetch raises RuntimeError when SSM is unavailable."""
 
@@ -157,8 +160,10 @@ class TestHandlerSsmFailure(unittest.TestCase):
         import importlib.util as _ilu
 
         with self.assertRaises(RuntimeError):
-            with patch("boto3.client", return_value=failing_ssm), \
-                 patch("boto3.resource", return_value=MagicMock()):
+            with (
+                patch("boto3.client", return_value=failing_ssm),
+                patch("boto3.resource", return_value=MagicMock()),
+            ):
                 spec = _ilu.spec_from_file_location("handler_fail", _HANDLER_PATH)
                 mod = _ilu.module_from_spec(spec)
                 spec.loader.exec_module(mod)
@@ -166,14 +171,18 @@ class TestHandlerSsmFailure(unittest.TestCase):
 
 # ── Tests: missing numeric fields ────────────────────────────────────────────
 
+
 class TestHandlerMissingNumericFields(unittest.TestCase):
     """Handler returns 200 with None for missing Salary/CompaRatio fields."""
 
     def setUp(self):
         self._table = MagicMock()
         _mock_dynamodb.Table.return_value = self._table
-        item_no_salary = {k: v for k, v in SAMPLE_ITEM.items()
-                          if k not in ("Salary", "CompaRatio", "HighestTitleSalary")}
+        item_no_salary = {
+            k: v
+            for k, v in SAMPLE_ITEM.items()
+            if k not in ("Salary", "CompaRatio", "HighestTitleSalary")
+        }
         self._table.get_item.return_value = {"Item": item_no_salary}
 
     def test_missing_salary_returns_none_not_error(self):

@@ -20,6 +20,7 @@ The script publishes a custom CloudWatch metric:
 A CloudWatch Alarm (hr-pipeline-reconciliation-mismatch) fires when this
 metric is 1 and notifies the hr-pipeline-alerts SNS topic.
 """
+
 import argparse
 import sys
 
@@ -58,6 +59,7 @@ def _fetch_config(region: str) -> dict:
 
 # ── Source count (S3 raw CSV) ─────────────────────────────────────────────────
 
+
 def count_source_rows(bucket: str, prefix: str, region: str) -> int:
     """
     Count data rows in the S3 raw CSV layer.
@@ -93,6 +95,7 @@ def count_source_rows(bucket: str, prefix: str, region: str) -> int:
 
 # ── Sink count (DynamoDB) ─────────────────────────────────────────────────────
 
+
 def count_sink_items(table_name: str, region: str) -> int:
     """
     Count PROFILE items in DynamoDB (one per employee).
@@ -117,6 +120,7 @@ def count_sink_items(table_name: str, region: str) -> int:
 
 # ── CloudWatch metric publish ─────────────────────────────────────────────────
 
+
 def publish_metric(value: int, region: str) -> None:
     """Publish ReconciliationMismatch metric (0 = clean, 1 = mismatch)."""
     cw = boto3.client("cloudwatch", region_name=region)
@@ -133,6 +137,7 @@ def publish_metric(value: int, region: str) -> None:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
