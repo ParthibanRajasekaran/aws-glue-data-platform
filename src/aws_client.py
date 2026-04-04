@@ -122,7 +122,7 @@ class AWSClient:
 
     # AWS Glue specific methods
 
-    def list_glue_jobs(self) -> List[Dict[str, Any]]:
+    def list_glue_jobs(self) -> List[str]:
         """List all Glue jobs"""
         try:
             response = self.glue.list_jobs(MaxResults=100)
@@ -137,7 +137,6 @@ class AWSClient:
         role_arn: str,
         script_location: str,
         description: str = "",
-        max_capacity: float = 2.0,
     ) -> bool:
         """Create a new Glue job"""
         try:
@@ -151,7 +150,6 @@ class AWSClient:
                     "ScriptLocation": script_location,
                     "PythonVersion": "3",
                 },
-                MaxCapacity=max_capacity,
                 Timeout=60,
                 GlueVersion="4.0",
                 NumberOfWorkers=2,

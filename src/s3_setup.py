@@ -87,7 +87,6 @@ def configure_bucket_security(config: Config) -> None:
             "Rules": [
                 {
                     "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"},
-                    "BucketKeyEnabled": False,
                 }
             ]
         },

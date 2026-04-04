@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from aws_client import AWSClient
+from .aws_client import AWSClient
 
 
 def main():
