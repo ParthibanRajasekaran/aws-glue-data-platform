@@ -1,4 +1,4 @@
-# aws-glue-demo - HR Analytics ETL Pipeline
+# aws-glue-data-platform - HR Analytics ETL Pipeline
 
 HR compensation data typically lives across disconnected spreadsheets - raw employee records, salary bands, and manager hierarchies that nobody has joined together. This pipeline ingests those three CSV sources, enriches them with computed fields (compa-ratio, salary band position, manager activity flags), and serves the result two ways: a low-latency Lambda API for individual lookups and a partitioned Parquet data lake for Athena analytics.
 
@@ -211,7 +211,7 @@ All resources have `REMOVAL_POLICY.DESTROY`. The KMS key enters a 7-day schedule
 ## Project Structure
 
 ```
-aws-glue-demo/
+aws-glue-data-platform/
 ├── data/
 │   ├── employee_data_updated.csv
 │   ├── departments_data.csv

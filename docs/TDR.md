@@ -6,7 +6,7 @@
 | **Date** | April 2026 |
 | **Status** | Implemented (main branch) |
 | **Published** | [Medium — AWS Glue: Production Reliability, FinOps, and UK GDPR Compliance](https://medium.com/@rajasekaran.parthiban7/aws-glue-production-reliability-finops-and-uk-gdpr-compliance-b9bbb11e4a50) |
-| **Repository** | [github.com/ParthibanRajasekaran/aws-glue-demo](https://github.com/ParthibanRajasekaran/aws-glue-demo) |
+| **Repository** | [github.com/ParthibanRajasekaran/aws-glue-data-platform](https://github.com/ParthibanRajasekaran/aws-glue-data-platform) |
 
 ---
 
